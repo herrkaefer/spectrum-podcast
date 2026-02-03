@@ -10,8 +10,6 @@ import {
   PaginationEllipsis,
   PaginationItem,
   PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
 } from '@/components/ui/pagination'
 import { cn } from '@/lib/utils'
 import { getPageStore } from '@/stores/page-store'
@@ -87,27 +85,25 @@ export function EpisodesPagination({ currentPage, totalPages }: EpisodesPaginati
       <Pagination>
         <PaginationContent>
           <PaginationItem>
-            <PaginationPrevious
-              className={cn(currentPage === 1 && `
-                pointer-events-none opacity-50
-              `)}
+            <PaginationLink
+              className={cn(
+                'cursor-pointer gap-1 pl-2.5',
+                currentPage === 1 && 'pointer-events-none opacity-50',
+              )}
+              aria-label={t('pagination.previous')}
+              aria-disabled={currentPage === 1}
+              tabIndex={currentPage === 1 ? -1 : undefined}
+              onClick={() => setPage(Math.max(1, currentPage - 1))}
             >
-              <button
-                type="button"
-                onClick={() => setPage(Math.max(1, currentPage - 1))}
-                disabled={currentPage === 1}
-                className="inline-flex w-full items-center justify-center gap-1"
+              <ChevronLeftIcon className="size-4" />
+              <span className={`
+                hidden
+                sm:block
+              `}
               >
-                <ChevronLeftIcon />
-                <span className={`
-                  hidden
-                  sm:block
-                `}
-                >
-                  {t('pagination.previous')}
-                </span>
-              </button>
-            </PaginationPrevious>
+                {t('pagination.previous')}
+              </span>
+            </PaginationLink>
           </PaginationItem>
 
           {pages.map((item) => {
@@ -125,40 +121,40 @@ export function EpisodesPagination({ currentPage, totalPages }: EpisodesPaginati
                 <PaginationLink
                   isActive={page === currentPage}
                   className={cn(
+                    'cursor-pointer',
                     page === currentPage && `
                       bg-theme text-white
                       hover:bg-theme-hover hover:text-white
                     `,
                   )}
+                  onClick={() => setPage(page)}
                 >
-                  <button type="button" onClick={() => setPage(page)}>{page}</button>
+                  {page}
                 </PaginationLink>
               </PaginationItem>
             )
           })}
 
           <PaginationItem>
-            <PaginationNext
-              className={cn(currentPage === totalPages && `
-                pointer-events-none opacity-50
-              `)}
+            <PaginationLink
+              className={cn(
+                'cursor-pointer gap-1 pr-2.5',
+                currentPage === totalPages && 'pointer-events-none opacity-50',
+              )}
+              aria-label={t('pagination.next')}
+              aria-disabled={currentPage === totalPages}
+              tabIndex={currentPage === totalPages ? -1 : undefined}
+              onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
             >
-              <button
-                type="button"
-                onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
-                disabled={currentPage === totalPages}
-                className="inline-flex w-full items-center justify-center gap-1"
+              <span className={`
+                hidden
+                sm:block
+              `}
               >
-                <span className={`
-                  hidden
-                  sm:block
-                `}
-                >
-                  {t('pagination.next')}
-                </span>
-                <ChevronRightIcon />
-              </button>
-            </PaginationNext>
+                {t('pagination.next')}
+              </span>
+              <ChevronRightIcon className="size-4" />
+            </PaginationLink>
           </PaginationItem>
         </PaginationContent>
       </Pagination>
