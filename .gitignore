@@ -44,3 +44,5 @@ next-env.d.ts
 # dev.vars
 .dev.vars
 .claude/
+# Source config overrides
+workflow/sources/config.local.ts

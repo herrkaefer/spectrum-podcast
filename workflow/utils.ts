@@ -2,7 +2,7 @@ import puppeteer from '@cloudflare/puppeteer'
 import * as cheerio from 'cheerio'
 import { $fetch } from 'ofetch'
 
-async function getContentFromJina(url: string, format: 'html' | 'markdown', selector?: { include?: string, exclude?: string }, JINA_KEY?: string) {
+export async function getContentFromJina(url: string, format: 'html' | 'markdown', selector?: { include?: string, exclude?: string }, JINA_KEY?: string) {
   const jinaHeaders: HeadersInit = {
     'X-Retain-Images': 'none',
     'X-Return-Format': format,
@@ -29,7 +29,7 @@ async function getContentFromJina(url: string, format: 'html' | 'markdown', sele
   return content
 }
 
-async function getContentFromFirecrawl(url: string, format: 'html' | 'markdown', selector?: { include?: string, exclude?: string }, FIRECRAWL_KEY?: string) {
+export async function getContentFromFirecrawl(url: string, format: 'html' | 'markdown', selector?: { include?: string, exclude?: string }, FIRECRAWL_KEY?: string) {
   const firecrawlHeaders: HeadersInit = {
     Authorization: `Bearer ${FIRECRAWL_KEY}`,
   }
@@ -125,6 +125,36 @@ ${article.substring(0, maxTokens * 5)}
 <comments>
 ${comments.substring(0, maxTokens * 5)}
 </comments>
+`
+      : '',
+  ].filter(Boolean).join('\n\n---\n\n')
+}
+
+export async function getStoryContent(story: Story, maxTokens: number, { JINA_KEY, FIRECRAWL_KEY }: { JINA_KEY?: string, FIRECRAWL_KEY?: string }) {
+  if (!story.url) {
+    throw new Error('story url is empty')
+  }
+
+  const storyUrl = story.url
+  const article = await getContentFromJina(storyUrl, 'markdown', {}, JINA_KEY)
+    .catch((error) => {
+      console.error('getStoryContent from Jina failed', error)
+      return getContentFromFirecrawl(storyUrl, 'markdown', {}, FIRECRAWL_KEY)
+    })
+
+  return [
+    story.title
+      ? `
+<title>
+${story.title}
+</title>
+`
+      : '',
+    article
+      ? `
+<article>
+${article.substring(0, maxTokens * 5)}
+</article>
 `
       : '',
   ].filter(Boolean).join('\n\n---\n\n')
