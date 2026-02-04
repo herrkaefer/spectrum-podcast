@@ -43,6 +43,7 @@ interface GmailEnv {
   GMAIL_CLIENT_SECRET?: string
   GMAIL_REFRESH_TOKEN?: string
   GMAIL_USER_EMAIL?: string
+  NODE_ENV?: string
 }
 
 function decodeBase64Url(data: string) {
@@ -109,35 +110,233 @@ function matchesAny(text: string, patterns?: string[]) {
   return patterns.some(pattern => lower.includes(pattern.toLowerCase()))
 }
 
-function extractLinks(html: string, rules?: LinkRules) {
+const trackingHostnames = [
+  'list-manage.com',
+  'campaign-archive.com',
+  'mailchi.mp',
+  'clicks',
+  'links',
+]
+
+const defaultExcludeText = [
+  'unsubscribe',
+  'subscribe',
+  'privacy',
+  'terms',
+  'terms and conditions',
+  'contact',
+  'manage preferences',
+  'preferences',
+  'forward',
+  'share',
+  'tweet',
+  'facebook',
+  'twitter',
+  'linkedin',
+  'instagram',
+  'youtube',
+  'rss',
+]
+
+const defaultExcludePathKeywords = [
+  '/webinar/',
+  '/category/',
+  '/unsubscribe',
+  '/subscribe',
+  '/privacy',
+  '/terms',
+  '/contact',
+]
+
+function unwrapTrackingUrl(href: string) {
+  let url: URL
+  try {
+    url = new URL(href)
+  }
+  catch {
+    return { href, unwrapped: false }
+  }
+
+  const hostname = url.hostname.toLowerCase()
+  const isTrackingHost = trackingHostnames.some(keyword => hostname.includes(keyword))
+  const isTrackingPath = url.pathname.toLowerCase().includes('/track/')
+
+  if (!isTrackingHost && !isTrackingPath) {
+    return { href, unwrapped: false }
+  }
+
+  const candidates = ['url', 'u', 'redirect', 'link', 'r', 'destination']
+  for (const key of candidates) {
+    const value = url.searchParams.get(key)
+    if (!value) {
+      continue
+    }
+    const decoded = decodeURIComponent(value)
+    if (decoded.startsWith('http://') || decoded.startsWith('https://')) {
+      return { href: decoded, unwrapped: true }
+    }
+  }
+
+  return { href, unwrapped: false }
+}
+
+async function resolveTrackingRedirect(href: string, cache: Map<string, string>) {
+  if (cache.has(href)) {
+    return cache.get(href) || href
+  }
+
+  let url: URL
+  try {
+    url = new URL(href)
+  }
+  catch {
+    cache.set(href, href)
+    return href
+  }
+
+  try {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 8000)
+    const response = await fetch(href, { redirect: 'manual', signal: controller.signal })
+    clearTimeout(timeout)
+
+    const location = response.headers.get('location')
+    if (location) {
+      const resolved = location.startsWith('http')
+        ? location
+        : new URL(location, url.origin).toString()
+      cache.set(href, resolved)
+      return resolved
+    }
+  }
+  catch {
+    // ignore and fall back to original
+  }
+
+  cache.set(href, href)
+  return href
+}
+
+function normalizeUrlPath(pathname: string) {
+  return pathname ? pathname.toLowerCase() : ''
+}
+
+function getUrlPathDepth(pathname: string) {
+  return pathname.split('/').filter(Boolean).length
+}
+
+function getLastPathSegment(pathname: string) {
+  const parts = pathname.split('/').filter(Boolean)
+  return parts.length ? parts[parts.length - 1] : ''
+}
+
+function scoreArticleLink(link: { href: string, text: string }, rules?: LinkRules) {
+  const minTextLength = rules?.minTextLength ?? 8
+  let url: URL
+
+  try {
+    url = new URL(link.href)
+  }
+  catch {
+    return -1
+  }
+
+  const path = normalizeUrlPath(url.pathname)
+  const text = link.text || ''
+  let score = 0
+
+  if (getUrlPathDepth(path) >= 2) {
+    score += 1
+  }
+
+  const lastSegment = getLastPathSegment(path)
+  if (lastSegment.length >= 10 && /[-_]/.test(lastSegment)) {
+    score += 1
+  }
+
+  if (rules?.includePathKeywords && rules.includePathKeywords.length > 0) {
+    if (rules.includePathKeywords.some(keyword => path.includes(keyword.toLowerCase()))) {
+      score += 1
+    }
+  }
+
+  if (text.length >= minTextLength) {
+    score += 1
+  }
+
+  return score
+}
+
+async function extractLinks(html: string, rules?: LinkRules, debug?: { subject?: string, messageId?: string }) {
   const $ = cheerio.load(html)
   const links = $('a[href]').map((_, el) => {
-    const href = $(el).attr('href')?.trim() || ''
+    const rawHref = $(el).attr('href')?.trim() || ''
+    const { href, unwrapped } = unwrapTrackingUrl(rawHref)
     const text = normalizeText($(el).text())
+    const imageAlt = normalizeText($(el).find('img').attr('alt') || '')
     const title = normalizeText($(el).attr('title') || '')
     const aria = normalizeText($(el).attr('aria-label') || '')
-    const displayText = text || aria || title
-    return { href, text: displayText }
+    const displayText = text || imageAlt || aria || title
+    return { href, text: displayText, unwrapped, rawHref }
   }).get()
 
-  const filtered = links.filter((link) => {
+  const resolveTrackingLinks = rules?.resolveTrackingLinks !== false
+  const trackingCache = new Map<string, string>()
+  let resolvedCount = 0
+  let failedResolveCount = 0
+
+  const resolvedLinks = resolveTrackingLinks
+    ? await Promise.all(links.map(async (link) => {
+        const rawUrl = link.href
+        let resolvedHref = rawUrl
+        if (!link.unwrapped) {
+          const hostname = (() => {
+            try {
+              return new URL(rawUrl).hostname.toLowerCase()
+            }
+            catch {
+              return ''
+            }
+          })()
+          const isTrackingHost = trackingHostnames.some(keyword => hostname.includes(keyword))
+          if (isTrackingHost) {
+            resolvedHref = await resolveTrackingRedirect(rawUrl, trackingCache)
+            if (resolvedHref !== rawUrl) {
+              resolvedCount += 1
+            }
+            else {
+              failedResolveCount += 1
+            }
+          }
+        }
+        return { ...link, href: resolvedHref }
+      }))
+    : links
+
+  const filtered = resolvedLinks.filter((link) => {
     if (!link.href) {
       return false
     }
 
     const text = link.text || ''
-    if (rules?.excludeText && matchesAny(text, rules.excludeText)) {
+    const excludeText = [...defaultExcludeText, ...(rules?.excludeText || [])]
+    if (matchesAny(text, excludeText)) {
       return false
-    }
-
-    if (rules?.includeText && rules.includeText.length > 0) {
-      return matchesAny(text, rules.includeText)
     }
 
     return true
   })
 
-  const domainFiltered = filtered.filter((link) => {
+  const uniqueByHref = new Map<string, typeof filtered[number]>()
+  for (const link of filtered) {
+    const existing = uniqueByHref.get(link.href)
+    if (!existing || (link.text && link.text.length > (existing.text || '').length)) {
+      uniqueByHref.set(link.href, link)
+    }
+  }
+  const deduped = Array.from(uniqueByHref.values())
+
+  const domainFiltered = deduped.filter((link) => {
     if (!rules?.includeDomains && !rules?.excludeDomains) {
       return true
     }
@@ -160,7 +359,55 @@ function extractLinks(html: string, rules?: LinkRules) {
     }
   })
 
-  return domainFiltered
+  const pathFiltered = domainFiltered.filter((link) => {
+    const excludePathKeywords = [...defaultExcludePathKeywords, ...(rules?.excludePathKeywords || [])]
+    if (!excludePathKeywords.length) {
+      return true
+    }
+    try {
+      const pathname = new URL(link.href).pathname.toLowerCase()
+      return !excludePathKeywords.some(keyword => pathname.includes(keyword.toLowerCase()))
+    }
+    catch {
+      return false
+    }
+  })
+
+  const minScore = rules?.minArticleScore ?? 2
+  const scored = pathFiltered.map(link => ({
+    ...link,
+    score: scoreArticleLink(link, rules),
+  }))
+
+  const kept = scored.filter(link => link.score >= minScore)
+
+  if (rules?.debug) {
+    const maxLinks = rules.debugMaxLinks ?? 20
+    console.info('newsletter link debug', {
+      subject: debug?.subject,
+      messageId: debug?.messageId,
+      total: links.length,
+      unwrapped: links.filter(link => link.unwrapped).length,
+      trackingResolved: resolvedCount,
+      trackingResolveFailed: failedResolveCount,
+      afterTextFilter: filtered.length,
+      afterDedup: deduped.length,
+      afterDomainFilter: domainFiltered.length,
+      afterPathFilter: pathFiltered.length,
+      afterScoreFilter: kept.length,
+      minScore,
+    })
+    kept.slice(0, maxLinks).forEach((link) => {
+      console.info('newsletter link kept', {
+        text: link.text,
+        href: link.href,
+        score: link.score,
+        unwrapped: link.unwrapped,
+      })
+    })
+  }
+
+  return kept
 }
 
 async function fetchAccessToken(env: GmailEnv) {
@@ -226,7 +473,10 @@ export async function fetchGmailItems(
   const token = await fetchAccessToken(env)
   const windowStart = new Date(now.getTime() - lookbackDays * 24 * 60 * 60 * 1000)
   const query = buildGmailQuery(source.label, windowStart, now)
-  const maxMessages = source.maxMessages || 50
+  let maxMessages = source.maxMessages || 50
+  if (env.NODE_ENV && env.NODE_ENV !== 'production') {
+    maxMessages = Math.min(maxMessages, 2)
+  }
 
   const messageRefs = await listMessages(userId, query, maxMessages, token)
 
@@ -249,7 +499,7 @@ export async function fetchGmailItems(
       continue
     }
 
-    const links = extractLinks(html, source.linkRules)
+    const links = await extractLinks(html, source.linkRules, { subject, messageId: message.id })
     if (links.length === 0) {
       console.warn('gmail message has no matching links', { id: message.id, subject })
       continue
@@ -265,6 +515,7 @@ export async function fetchGmailItems(
         sourceUrl: source.url,
         publishedAt: receivedAt.toISOString(),
         sourceItemId: message.id,
+        sourceItemTitle: subject,
       })
     })
   }
