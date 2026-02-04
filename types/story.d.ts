@@ -6,4 +6,5 @@ interface Story {
   sourceName?: string
   sourceUrl?: string
   publishedAt?: string
+  sourceItemId?: string
 }

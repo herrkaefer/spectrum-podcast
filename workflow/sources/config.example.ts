@@ -10,6 +10,21 @@ export const sources: SourceConfig[] = [
     url: 'https://example.com/rss.xml',
   },
   {
+    id: 'example-gmail',
+    name: 'Example Gmail',
+    type: 'gmail',
+    url: 'gmail://Spectrum',
+    label: 'Spectrum',
+    maxMessages: 20,
+    linkRules: {
+      includeText: [
+        'READ NOW',
+        'View it in your browser',
+      ],
+    },
+    enabled: false,
+  },
+  {
     id: 'example-site',
     name: 'Example Site',
     type: 'url',

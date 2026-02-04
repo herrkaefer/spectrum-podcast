@@ -1,6 +1,7 @@
 import type { SourceConfig } from './types'
 
 import { loadSourceConfig } from './config'
+import { fetchGmailItems } from './gmail'
 import { fetchRssItems } from './rss'
 
 function isEnabled(source: SourceConfig) {
@@ -11,7 +12,7 @@ function getLookbackDays(source: SourceConfig, defaultLookbackDays: number) {
   return source.lookbackDays ?? defaultLookbackDays
 }
 
-export async function getStoriesFromSources(options?: { now?: Date }) {
+export async function getStoriesFromSources(options?: { now?: Date, env?: CloudflareEnv }) {
   const now = options?.now ?? new Date()
   const { sources, lookbackDays } = await loadSourceConfig()
   const enabledSources = sources.filter(isEnabled)
@@ -20,8 +21,16 @@ export async function getStoriesFromSources(options?: { now?: Date }) {
     enabledSources.map(async (source) => {
       const days = getLookbackDays(source, lookbackDays)
       switch (source.type) {
-        case 'rss':
-          return fetchRssItems(source, now, days)
+        case 'rss': {
+          return await fetchRssItems(source, now, days)
+        }
+        case 'gmail': {
+          if (!options?.env) {
+            console.warn('gmail source requires env, skip', source)
+            return []
+          }
+          return await fetchGmailItems(source, now, days, options.env)
+        }
         case 'url':
           return [
             {

@@ -19,6 +19,10 @@ interface Env extends CloudflareEnv {
   OPENAI_THINKING_MODEL?: string
   OPENAI_MAX_TOKENS?: string
   JINA_KEY?: string
+  GMAIL_CLIENT_ID?: string
+  GMAIL_CLIENT_SECRET?: string
+  GMAIL_REFRESH_TOKEN?: string
+  GMAIL_USER_EMAIL?: string
   NODE_ENV: string
   HACKER_PODCAST_WORKER_URL: string
   HACKER_PODCAST_R2_BUCKET_URL: string
@@ -57,15 +61,38 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     const maxTokens = Number.parseInt(this.env.OPENAI_MAX_TOKENS || '4096')
 
     const stories = await step.do(`get stories ${today}`, retryConfig, async () => {
-      const topStories = await getStoriesFromSources({ now })
+      const topStories = await getStoriesFromSources({ now, env: this.env })
 
       if (!topStories.length) {
         throw new Error('no stories found')
       }
 
-      topStories.length = Math.min(topStories.length, isDev ? 1 : 10)
+      if (!isDev) {
+        return topStories
+      }
 
-      return topStories
+      const sourceFirstItem = new Map<string, Story>()
+      for (const story of topStories) {
+        const key = story.sourceName || story.sourceUrl || story.url || 'unknown'
+        if (!sourceFirstItem.has(key)) {
+          sourceFirstItem.set(key, story)
+        }
+      }
+
+      const allowedSourceItems = new Map<string, string>()
+      for (const [key, story] of sourceFirstItem.entries()) {
+        if (story.sourceItemId) {
+          allowedSourceItems.set(key, story.sourceItemId)
+        }
+      }
+
+      return topStories.filter((story) => {
+        const key = story.sourceName || story.sourceUrl || story.url || 'unknown'
+        if (!allowedSourceItems.has(key)) {
+          return sourceFirstItem.get(key) === story
+        }
+        return story.sourceItemId === allowedSourceItems.get(key)
+      })
     })
 
     console.info('top stories', isDev ? stories : JSON.stringify(stories))
