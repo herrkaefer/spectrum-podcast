@@ -1,6 +1,4 @@
 import type { WorkflowEvent, WorkflowStep, WorkflowStepConfig } from 'cloudflare:workers'
-import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
-import { generateText } from 'ai'
 import { WorkflowEntrypoint } from 'cloudflare:workers'
 import { podcastTitle } from '@/config'
 import { introPrompt, summarizeBlogPrompt, summarizePodcastPrompt, summarizeStoryPrompt } from './prompt'
@@ -29,6 +27,114 @@ interface Env extends CloudflareEnv {
   PODCAST_WORKFLOW: Workflow
   BROWSER: Fetcher
   SKIP_TTS?: string
+  WORKFLOW_TEST_STEP?: string
+  WORKFLOW_TEST_INPUT?: string
+  WORKFLOW_TEST_INSTRUCTIONS?: string
+}
+
+interface ResponsesMessageContent {
+  type?: string
+  text?: string
+}
+
+interface ResponsesOutputItem {
+  type?: string
+  role?: string
+  content?: ResponsesMessageContent[]
+}
+
+interface ResponsesBody {
+  output_text?: string
+  output?: ResponsesOutputItem[]
+  usage?: unknown
+  status?: string
+  error?: { message?: string }
+}
+
+interface ResponseTextResult {
+  text: string
+  usage?: unknown
+  finishReason?: string
+}
+
+const defaultOpenAIBaseUrl = 'https://api.openai.com/v1'
+
+function buildResponsesUrl(baseUrl?: string): string {
+  const normalized = (baseUrl || defaultOpenAIBaseUrl).replace(/\/$/, '')
+  return `${normalized}/responses`
+}
+
+function extractOutputText(body: ResponsesBody): string {
+  if (typeof body.output_text === 'string') {
+    return body.output_text
+  }
+  if (!Array.isArray(body.output)) {
+    return ''
+  }
+  const texts: string[] = []
+  for (const item of body.output) {
+    if (!item || item.type !== 'message' || !Array.isArray(item.content)) {
+      continue
+    }
+    for (const content of item.content) {
+      if (content?.type === 'output_text' && typeof content.text === 'string') {
+        texts.push(content.text)
+      }
+      else if (content?.type === 'text' && typeof content.text === 'string') {
+        texts.push(content.text)
+      }
+    }
+  }
+  return texts.join('')
+}
+
+async function createResponseText(params: {
+  env: Env
+  model: string
+  instructions: string
+  input: string
+  maxOutputTokens?: number
+}): Promise<ResponseTextResult> {
+  const { env, model, instructions, input, maxOutputTokens } = params
+  const url = buildResponsesUrl(env.OPENAI_BASE_URL)
+  const body: Record<string, unknown> = {
+    model,
+    instructions,
+    input,
+  }
+  if (typeof maxOutputTokens === 'number' && Number.isFinite(maxOutputTokens)) {
+    body.max_output_tokens = maxOutputTokens
+  }
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${env.OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    throw new Error(`OpenAI Responses API error: ${response.status} ${response.statusText} ${errorText}`)
+  }
+
+  const data = (await response.json()) as ResponsesBody
+  if (data.error?.message) {
+    throw new Error(`OpenAI Responses API error: ${data.error.message}`)
+  }
+
+  const text = extractOutputText(data)
+  if (!text) {
+    throw new Error('OpenAI Responses API returned empty output')
+  }
+
+  return {
+    text,
+    usage: data.usage,
+    finishReason: data.status,
+  }
 }
 
 const retryConfig: WorkflowStepConfig = {
@@ -51,14 +157,89 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     const runDate = new Date(`${today}T23:59:59Z`)
     const now = Number.isNaN(runDate.getTime()) ? new Date() : runDate
     const skipTTS = this.env.SKIP_TTS === 'true'
-    const openai = createOpenAICompatible({
-      name: 'openai',
-      baseURL: this.env.OPENAI_BASE_URL!,
-      headers: {
-        Authorization: `Bearer ${this.env.OPENAI_API_KEY!}`,
-      },
-    })
     const maxTokens = Number.parseInt(this.env.OPENAI_MAX_TOKENS || '4096')
+    const testStep = (this.env.WORKFLOW_TEST_STEP || '').trim().toLowerCase()
+
+    if (testStep) {
+      const fallbackInput = 'Summarize the following in one sentence: This is a short test input.'
+      const fallbackInstructions = 'You are a concise assistant.'
+      const testInput = this.env.WORKFLOW_TEST_INPUT || fallbackInput
+      const testInstructions = this.env.WORKFLOW_TEST_INSTRUCTIONS || fallbackInstructions
+
+      const text = await step.do(`workflow test step: ${testStep}`, retryConfig, async () => {
+        if (testStep === 'openai' || testStep === 'responses') {
+          return (await createResponseText({
+            env: this.env,
+            model: this.env.OPENAI_MODEL!,
+            instructions: testInstructions,
+            input: testInput,
+            maxOutputTokens: maxTokens,
+          })).text
+        }
+
+        if (testStep === 'story') {
+          const stories = await getStoriesFromSources({ now, env: this.env })
+          const story = stories[0]
+          if (!story) {
+            throw new Error('workflow test step "story": no stories found')
+          }
+          const storyResponse = await getStoryContent(story, maxTokens, this.env)
+          return (await createResponseText({
+            env: this.env,
+            model: this.env.OPENAI_MODEL!,
+            instructions: summarizeStoryPrompt,
+            input: storyResponse,
+          })).text
+        }
+
+        if (testStep === 'podcast') {
+          const sampleStories = [
+            '<story>这是一条测试摘要，讨论了一个新工具如何提升开发效率。</story>',
+            '<story>另一条摘要聚焦隐私与数据安全的最新争议与观点。</story>',
+          ].join('\n\n---\n\n')
+          return (await createResponseText({
+            env: this.env,
+            model: this.env.OPENAI_THINKING_MODEL || this.env.OPENAI_MODEL!,
+            instructions: summarizePodcastPrompt,
+            input: this.env.WORKFLOW_TEST_INPUT || sampleStories,
+            maxOutputTokens: maxTokens,
+          })).text
+        }
+
+        if (testStep === 'blog') {
+          const sampleStories = [
+            '<story>这是一条测试摘要，讨论了一个新工具如何提升开发效率。</story>',
+            '<story>另一条摘要聚焦隐私与数据安全的最新争议与观点。</story>',
+          ].join('\n\n---\n\n')
+          const sampleInput = `<stories>[]</stories>\n\n---\n\n${sampleStories}`
+          return (await createResponseText({
+            env: this.env,
+            model: this.env.OPENAI_THINKING_MODEL || this.env.OPENAI_MODEL!,
+            instructions: summarizeBlogPrompt,
+            input: this.env.WORKFLOW_TEST_INPUT || sampleInput,
+            maxOutputTokens: maxTokens,
+          })).text
+        }
+
+        if (testStep === 'intro') {
+          const sampleInput = this.env.WORKFLOW_TEST_INPUT || '女：Hello 大家好，欢迎收听测试播客。\n男：大家好，我是老冯。'
+          return (await createResponseText({
+            env: this.env,
+            model: this.env.OPENAI_MODEL!,
+            instructions: introPrompt,
+            input: sampleInput,
+            maxOutputTokens: maxTokens,
+          })).text
+        }
+
+        throw new Error(`workflow test step "${testStep}" is not supported`)
+      })
+
+      console.info(`workflow test step "${testStep}" result`, {
+        text: isDev ? text : text.slice(0, 200),
+      })
+      return
+    }
 
     const stories = await step.do(`get stories ${today}`, retryConfig, async () => {
       const topStories = await getStoriesFromSources({ now, env: this.env })
@@ -123,10 +304,11 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
       console.info(`get story ${story.id} content success`)
 
       const text = await step.do(`summarize story ${story.id}: ${story.title}`, retryConfig, async () => {
-        const { text, usage, finishReason } = await generateText({
-          model: openai(this.env.OPENAI_MODEL!),
-          system: summarizeStoryPrompt,
-          prompt: storyResponse,
+        const { text, usage, finishReason } = await createResponseText({
+          env: this.env,
+          model: this.env.OPENAI_MODEL!,
+          instructions: summarizeStoryPrompt,
+          input: storyResponse,
         })
 
         console.info(`get story ${story.id} summary success`, { text, usage, finishReason })
@@ -155,12 +337,12 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     })
 
     const podcastContent = await step.do('create podcast content', retryConfig, async () => {
-      const { text, usage, finishReason } = await generateText({
-        model: openai(this.env.OPENAI_THINKING_MODEL || this.env.OPENAI_MODEL!),
-        system: summarizePodcastPrompt,
-        prompt: allStories.join('\n\n---\n\n'),
+      const { text, usage, finishReason } = await createResponseText({
+        env: this.env,
+        model: this.env.OPENAI_THINKING_MODEL || this.env.OPENAI_MODEL!,
+        instructions: summarizePodcastPrompt,
+        input: allStories.join('\n\n---\n\n'),
         maxOutputTokens: maxTokens,
-        maxRetries: 3,
       })
 
       console.info(`create hacker podcast content success`, { text, usage, finishReason })
@@ -173,12 +355,12 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     await step.sleep('Give AI a break', breakTime)
 
     const blogContent = await step.do('create blog content', retryConfig, async () => {
-      const { text, usage, finishReason } = await generateText({
-        model: openai(this.env.OPENAI_THINKING_MODEL || this.env.OPENAI_MODEL!),
-        system: summarizeBlogPrompt,
-        prompt: `<stories>${JSON.stringify(stories)}</stories>\n\n---\n\n${allStories.join('\n\n---\n\n')}`,
+      const { text, usage, finishReason } = await createResponseText({
+        env: this.env,
+        model: this.env.OPENAI_THINKING_MODEL || this.env.OPENAI_MODEL!,
+        instructions: summarizeBlogPrompt,
+        input: `<stories>${JSON.stringify(stories)}</stories>\n\n---\n\n${allStories.join('\n\n---\n\n')}`,
         maxOutputTokens: maxTokens,
-        maxRetries: 3,
       })
 
       console.info(`create hacker daily blog content success`, { text, usage, finishReason })
@@ -191,11 +373,11 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     await step.sleep('Give AI a break', breakTime)
 
     const introContent = await step.do('create intro content', retryConfig, async () => {
-      const { text, usage, finishReason } = await generateText({
-        model: openai(this.env.OPENAI_MODEL!),
-        system: introPrompt,
-        prompt: podcastContent,
-        maxRetries: 3,
+      const { text, usage, finishReason } = await createResponseText({
+        env: this.env,
+        model: this.env.OPENAI_MODEL!,
+        instructions: introPrompt,
+        input: podcastContent,
       })
 
       console.info(`create intro content success`, { text, usage, finishReason })

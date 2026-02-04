@@ -8,9 +8,6 @@ importers:
 
   .:
     dependencies:
-      '@ai-sdk/openai-compatible':
-        specifier: ^1.0.29
-        version: 1.0.29(zod@4.2.1)
       '@cloudflare/puppeteer':
         specifier: ^1.0.4
         version: 1.0.4
