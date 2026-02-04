@@ -28,7 +28,7 @@ export default async function Home({
   const posts = (
     await Promise.all(
       pageDays.map(async (day) => {
-        const post = await env.HACKER_PODCAST_KV.get(`${kvPrefix}${day}`, 'json')
+        const post = await env.PODCAST_KV.get(`${kvPrefix}${day}`, 'json')
         return post as unknown as Article
       }),
     )

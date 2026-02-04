@@ -1,7 +1,7 @@
 export * from '../workflow'
 
 interface Env extends CloudflareEnv {
-  HACKER_PODCAST_WORKFLOW: Workflow
+  PODCAST_WORKFLOW: Workflow
   BROWSER: Fetcher
 }
 
@@ -10,7 +10,7 @@ export default {
     console.info('trigger event by:', event)
 
     const createWorkflow = async () => {
-      const instance = await env.HACKER_PODCAST_WORKFLOW.create()
+      const instance = await env.PODCAST_WORKFLOW.create()
 
       const instanceDetails = {
         id: instance.id,
@@ -33,7 +33,7 @@ export default {
     }
     if (pathname.includes('/static')) {
       const filename = pathname.replace('/static/', '')
-      const file = await env.HACKER_PODCAST_R2.get(filename)
+      const file = await env.PODCAST_R2.get(filename)
       console.info('fetch static file:', filename, {
         uploaded: file?.uploaded,
         size: file?.size,

@@ -4,7 +4,7 @@
  */
 {
   "$schema": "../node_modules/wrangler/config-schema.json",
-  "name": "hacker-podcast-tests",
+  "name": "podcast-tests",
   "main": "./audio.ts",
   "compatibility_date": "2025-11-15",
   "compatibility_flags": [

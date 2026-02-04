@@ -16,7 +16,7 @@ export async function generateMetadata({
   const { env } = await getCloudflareContext({ async: true })
   const runEnv = env.NODE_ENV || 'production'
   const { date } = await params
-  const post = (await env.HACKER_PODCAST_KV.get(`content:${runEnv}:hacker-podcast:${date}`, 'json')) as unknown as Article | null
+  const post = (await env.PODCAST_KV.get(`content:${runEnv}:hacker-podcast:${date}`, 'json')) as unknown as Article | null
 
   if (!post) {
     return notFound()
@@ -65,7 +65,7 @@ export default async function PostPage({
   const pageQuery = await searchParams
   const fallbackPage = Number.parseInt(pageQuery.page ?? '1', 10)
 
-  const post = (await env.HACKER_PODCAST_KV.get(`content:${runEnv}:hacker-podcast:${date}`, 'json')) as unknown as Article | null
+  const post = (await env.PODCAST_KV.get(`content:${runEnv}:hacker-podcast:${date}`, 'json')) as unknown as Article | null
 
   if (!post) {
     return notFound()

@@ -167,8 +167,8 @@ const retryConfig: WorkflowStepConfig = {
 OPENAI_API_KEY=
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4.1
-HACKER_PODCAST_WORKER_URL=
-HACKER_PODCAST_R2_BUCKET_URL=
+PODCAST_WORKER_URL=
+PODCAST_R2_BUCKET_URL=
 ```
 
 **Next.js (.env.local):**

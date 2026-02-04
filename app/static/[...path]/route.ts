@@ -4,6 +4,6 @@ export async function GET(request: Request, { params }: { params: Promise<{ path
   const { path } = await params
   const { env } = await getCloudflareContext({ async: true })
 
-  const file = await env.HACKER_PODCAST_R2.get(path.join('/'))
+  const file = await env.PODCAST_R2.get(path.join('/'))
   return new Response(file?.body)
 }

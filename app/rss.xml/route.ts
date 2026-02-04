@@ -41,13 +41,13 @@ export async function GET() {
   const pastDays = getPastDays(10)
   const posts = (await Promise.all(
     pastDays.map(async (day) => {
-      const post = await env.HACKER_PODCAST_KV.get(`content:${runEnv}:hacker-podcast:${day}`, 'json')
+      const post = await env.PODCAST_KV.get(`content:${runEnv}:hacker-podcast:${day}`, 'json')
       return post as unknown as Article
     }),
   )).filter(Boolean)
 
   const audioInfos = await Promise.all(
-    posts.map(post => env.HACKER_PODCAST_R2.head(post.audio)),
+    posts.map(post => env.PODCAST_R2.head(post.audio)),
   )
 
   posts.forEach((post, index) => {

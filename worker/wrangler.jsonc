@@ -4,7 +4,7 @@
  */
 {
   "$schema": "../node_modules/wrangler/config-schema.json",
-  "name": "hacker-podcast-worker",
+  "name": "podcast-worker",
   "main": "./index.ts",
   "minify": true,
   "upload_source_maps": true,
@@ -34,21 +34,21 @@
   },
   "workflows": [
     {
-      "name": "hacker-podcast-workflow",
-      "binding": "HACKER_PODCAST_WORKFLOW",
+      "name": "podcast-workflow",
+      "binding": "PODCAST_WORKFLOW",
       "class_name": "HackerNewsWorkflow"
     }
   ],
   "kv_namespaces": [
     {
-      "binding": "HACKER_PODCAST_KV",
+      "binding": "PODCAST_KV",
       "id": "bfc65509c1634589a29b90f956ab0d1a"
     }
   ],
   "r2_buckets": [
     {
-      "binding": "HACKER_PODCAST_R2",
-      "bucket_name": "hacker-podcast"
+      "binding": "PODCAST_R2",
+      "bucket_name": "podcast"
     }
   ]
 }

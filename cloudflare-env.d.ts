@@ -3,13 +3,13 @@
 // Runtime types generated with workerd@1.20251217.0 2025-11-15 nodejs_compat
 declare namespace Cloudflare {
 	interface Env {
-		HACKER_PODCAST_KV: KVNamespace;
+		PODCAST_KV: KVNamespace;
 		NEXT_CACHE_DO_QUEUE: DurableObjectNamespace /* DOQueueHandler */;
 		NEXT_TAG_CACHE_DO_SHARDED: DurableObjectNamespace /* DOShardedTagCache */;
 		NEXT_CACHE_DO_PURGE: DurableObjectNamespace /* BucketCachePurge */;
-		HACKER_PODCAST_R2: R2Bucket;
+		PODCAST_R2: R2Bucket;
 		NEXT_INC_CACHE_R2_BUCKET: R2Bucket;
-		WORKER_SELF_REFERENCE: Fetcher /* hacker-podcast */;
+		WORKER_SELF_REFERENCE: Fetcher /* podcast */;
 		ASSETS: Fetcher;
 	}
 }
