@@ -17,10 +17,13 @@ export const sources: SourceConfig[] = [
     label: 'Spectrum',
     maxMessages: 20,
     linkRules: {
-      includeText: [
-        'READ NOW',
-        'View it in your browser',
+      excludePathKeywords: [
+        '/webinar/',
+        '/category/',
+        '/contact',
       ],
+      minArticleScore: 2,
+      minTextLength: 8,
     },
     enabled: false,
   },

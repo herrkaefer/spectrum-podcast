@@ -96,6 +96,24 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     })
 
     console.info('top stories', isDev ? stories : JSON.stringify(stories))
+    console.info(`total stories: ${stories.length}`)
+
+    const storyGroups = new Map<string, { count: number, label: string }>()
+    for (const story of stories) {
+      const sourceLabel = story.sourceItemTitle || story.sourceName || story.sourceUrl || 'unknown'
+      const groupKey = story.sourceItemId || sourceLabel
+      const existing = storyGroups.get(groupKey)
+      if (existing) {
+        existing.count += 1
+      }
+      else {
+        storyGroups.set(groupKey, { count: 1, label: sourceLabel })
+      }
+    }
+
+    for (const [groupKey, group] of storyGroups.entries()) {
+      console.info(`newsletter: ${group.label} (${groupKey}) -> ${group.count} articles`)
+    }
 
     for (const story of stories) {
       const storyResponse = await step.do(`get story ${story.id}: ${story.title}`, retryConfig, async () => {

@@ -1,10 +1,16 @@
 export type SourceType = 'rss' | 'url' | 'gmail'
 
 export interface LinkRules {
-  includeText?: string[]
   excludeText?: string[]
   includeDomains?: string[]
   excludeDomains?: string[]
+  includePathKeywords?: string[]
+  excludePathKeywords?: string[]
+  minArticleScore?: number
+  minTextLength?: number
+  debug?: boolean
+  debugMaxLinks?: number
+  resolveTrackingLinks?: boolean
   preferOnlineVersion?: boolean
 }
 
