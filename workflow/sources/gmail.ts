@@ -1,8 +1,13 @@
+import type { AiEnv } from '../ai'
 import type { LinkRules, SourceConfig } from './types'
 
 import { Buffer } from 'node:buffer'
 import * as cheerio from 'cheerio'
 import { $fetch } from 'ofetch'
+
+import { createResponseText, getAiProvider, getPrimaryModel } from '../ai'
+import { extractNewsletterLinksPrompt } from '../prompt'
+import { getContentFromJinaWithRetry } from '../utils'
 
 interface GmailAccessTokenResponse {
   access_token: string
@@ -38,11 +43,12 @@ interface GmailMessage {
   payload?: GmailMessagePart
 }
 
-interface GmailEnv {
+interface GmailEnv extends AiEnv {
   GMAIL_CLIENT_ID?: string
   GMAIL_CLIENT_SECRET?: string
   GMAIL_REFRESH_TOKEN?: string
   GMAIL_USER_EMAIL?: string
+  JINA_KEY?: string
   NODE_ENV?: string
 }
 
@@ -102,14 +108,6 @@ function normalizeText(text: string) {
   return text.replace(/\s+/g, ' ').trim()
 }
 
-function matchesAny(text: string, patterns?: string[]) {
-  if (!patterns || patterns.length === 0) {
-    return false
-  }
-  const lower = text.toLowerCase()
-  return patterns.some(pattern => lower.includes(pattern.toLowerCase()))
-}
-
 const trackingHostnames = [
   'list-manage.com',
   'campaign-archive.com',
@@ -118,42 +116,26 @@ const trackingHostnames = [
   'links',
 ]
 
-const defaultExcludeText = [
-  'unsubscribe',
-  'subscribe',
-  'privacy',
-  'terms',
-  'terms and conditions',
-  'contact',
-  'manage preferences',
-  'preferences',
-  'forward',
-  'share',
-  'tweet',
-  'facebook',
-  'twitter',
-  'linkedin',
-  'instagram',
-  'youtube',
-  'rss',
-]
-
-const defaultExcludePathKeywords = [
-  '/webinar/',
-  '/category/',
-  '/unsubscribe',
-  '/subscribe',
-  '/privacy',
-  '/terms',
-  '/contact',
-]
-
 const CHICAGO_TIMEZONE = 'America/Chicago'
 const ONE_DAY_MS = 24 * 60 * 60 * 1000
 
 const archiveLinkKeywords = [
   'in your browser',
 ]
+
+const MAX_NEWSLETTER_LINKS = 10
+
+const newsletterLinkSchema = {
+  type: 'ARRAY',
+  items: {
+    type: 'OBJECT',
+    properties: {
+      link: { type: 'STRING' },
+      title: { type: 'STRING', nullable: true },
+    },
+    required: ['link'],
+  },
+} as const
 
 function unwrapTrackingUrl(href: string) {
   let url: URL
@@ -317,197 +299,317 @@ async function resolveTrackingRedirect(href: string, cache: Map<string, string>)
   return href
 }
 
-function normalizeUrlPath(pathname: string) {
-  return pathname ? pathname.toLowerCase() : ''
+interface NewsletterLinkCandidate {
+  title?: string
+  link: string
 }
 
-function getUrlPathDepth(pathname: string) {
-  return pathname.split('/').filter(Boolean).length
+function stripCodeFences(text: string) {
+  return text.replace(/```(?:json)?/gi, '').trim()
 }
 
-function getLastPathSegment(pathname: string) {
-  const parts = pathname.split('/').filter(Boolean)
-  return parts.length ? parts[parts.length - 1] : ''
+function extractJsonArray(text: string) {
+  const trimmed = text.trim()
+  if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+    return trimmed
+  }
+  const match = trimmed.match(/\[[\s\S]*\]/)
+  return match ? match[0] : ''
 }
 
-function scoreArticleLink(link: { href: string, text: string }, rules?: LinkRules) {
-  const minTextLength = rules?.minTextLength ?? 8
-  let url: URL
-
+function parseNewsletterLinks(text: string): NewsletterLinkCandidate[] {
+  const cleaned = stripCodeFences(text)
+  const json = extractJsonArray(cleaned)
+  if (!json) {
+    return []
+  }
+  let parsed: unknown
   try {
-    url = new URL(link.href)
+    parsed = JSON.parse(json)
   }
   catch {
-    return -1
+    return []
   }
-
-  const path = normalizeUrlPath(url.pathname)
-  const text = link.text || ''
-  let score = 0
-
-  if (getUrlPathDepth(path) >= 2) {
-    score += 1
+  if (!Array.isArray(parsed)) {
+    return []
   }
-
-  const lastSegment = getLastPathSegment(path)
-  if (lastSegment.length >= 10 && /[-_]/.test(lastSegment)) {
-    score += 1
-  }
-
-  if (rules?.includePathKeywords && rules.includePathKeywords.length > 0) {
-    if (rules.includePathKeywords.some(keyword => path.includes(keyword.toLowerCase()))) {
-      score += 1
+  const results: NewsletterLinkCandidate[] = []
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object') {
+      continue
     }
+    const record = item as Record<string, unknown>
+    const link = typeof record.link === 'string'
+      ? record.link
+      : typeof record.url === 'string'
+        ? record.url
+        : ''
+    if (!link) {
+      continue
+    }
+    const title = typeof record.title === 'string' ? record.title : undefined
+    results.push({
+      link: link.trim(),
+      title: title?.trim(),
+    })
   }
-
-  if (text.length >= minTextLength) {
-    score += 1
-  }
-
-  return score
+  return results
 }
 
-async function extractLinks(html: string, rules?: LinkRules, debug?: { subject?: string, messageId?: string }) {
-  const $ = cheerio.load(html)
-  const links = $('a[href]').map((_, el) => {
-    const rawHref = $(el).attr('href')?.trim() || ''
-    const { href, unwrapped } = unwrapTrackingUrl(rawHref)
-    const text = normalizeText($(el).text())
-    const imageAlt = normalizeText($(el).find('img').attr('alt') || '')
-    const title = normalizeText($(el).attr('title') || '')
-    const aria = normalizeText($(el).attr('aria-label') || '')
-    const displayText = text || imageAlt || aria || title
-    return { href, text: displayText, unwrapped, rawHref }
-  }).get()
+function normalizeUrl(input: string) {
+  const trimmed = input.trim().replace(/[),.\]]+$/, '')
+  if (!/^https?:\/\//i.test(trimmed)) {
+    return ''
+  }
+  try {
+    return new URL(trimmed).toString()
+  }
+  catch {
+    return ''
+  }
+}
 
-  const resolveTrackingLinks = rules?.resolveTrackingLinks !== false
+function getUrlKey(input: string) {
+  try {
+    const url = new URL(input)
+    url.hash = ''
+    return url.toString()
+  }
+  catch {
+    return input
+  }
+}
+
+async function htmlToPlainText(html: string) {
+  const sanitizedHtml = html
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<head[\s\S]*?<\/head>/gi, ' ')
+  const out: string[] = []
+  const rewriter = new HTMLRewriter()
+    .on('script, style, noscript, img, svg, footer, head', {
+      element(element) {
+        element.remove()
+      },
+    })
+    .on('a', {
+      element(element) {
+        const href = element.getAttribute('href')?.trim() || ''
+        const { href: unwrapped } = unwrapTrackingUrl(href)
+        if (unwrapped && /^https?:\/\//i.test(unwrapped)) {
+          out.push(` (${unwrapped})`)
+        }
+      },
+      text(text) {
+        if (text.text) {
+          out.push(text.text)
+        }
+      },
+    })
+    .on('h1, h2, h3', {
+      element() {
+        out.push('\n\n')
+      },
+      text(text) {
+        if (text.text) {
+          out.push(text.text.toUpperCase())
+        }
+      },
+    })
+    .on('p, li, blockquote', {
+      element() {
+        out.push('\n\n')
+      },
+      text(text) {
+        if (text.text) {
+          out.push(text.text)
+        }
+      },
+    })
+    .on('br', {
+      element() {
+        out.push('\n')
+      },
+    })
+    .on('*', {
+      text(text) {
+        if (text.text) {
+          out.push(text.text)
+        }
+      },
+    })
+  await rewriter.transform(new Response(sanitizedHtml)).text()
+  const text = out.join('').replace(/\s+/g, ' ').trim()
+  return text.replace(/[.#]?[\w-]+[^{}]{0,80}\{[^}]{1,200}\}/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+function buildNewsletterInput(params: {
+  subject: string
+  content: string
+  rules?: LinkRules
+}) {
+  const { subject, content, rules } = params
+  const lines: string[] = []
+  lines.push(`【邮件主题】${subject || '（无主题）'}`)
+  if (rules?.includeDomains && rules.includeDomains.length > 0) {
+    lines.push(`【仅允许域名】${rules.includeDomains.join(', ')}`)
+  }
+  if (rules?.excludeDomains && rules.excludeDomains.length > 0) {
+    lines.push(`【排除域名】${rules.excludeDomains.join(', ')}`)
+  }
+  if (rules?.excludePathKeywords && rules.excludePathKeywords.length > 0) {
+    lines.push(`【排除路径关键词】${rules.excludePathKeywords.join(', ')}`)
+  }
+  if (rules?.excludeText && rules.excludeText.length > 0) {
+    lines.push(`【额外排除文本】${rules.excludeText.join(', ')}`)
+  }
+  lines.push('【内容】')
+  lines.push(content)
+  return lines.join('\n')
+}
+
+async function extractNewsletterLinksWithAi(params: {
+  subject: string
+  content: string
+  source: SourceConfig
+  env: GmailEnv
+  messageId: string
+  receivedAt: string
+}) {
+  const { subject, content, source, env, messageId, receivedAt } = params
+  const rules = source.linkRules
+  const provider = getAiProvider(env)
+  const model = getPrimaryModel(env, provider)
+  const input = buildNewsletterInput({ subject, content, rules })
+  const maxOutputTokens = 4096
+
+  const response = await createResponseText({
+    env,
+    model,
+    instructions: extractNewsletterLinksPrompt,
+    input,
+    maxOutputTokens,
+    responseMimeType: 'application/json',
+    responseSchema: newsletterLinkSchema,
+  })
+
+  if (rules?.debug) {
+    console.info('newsletter ai raw response', {
+      subject,
+      messageId,
+      receivedAt,
+      provider,
+      model,
+      outputLength: response.text.length,
+      finishReason: response.finishReason,
+      output: response.text,
+    })
+  }
+
+  let rawCandidates = parseNewsletterLinks(response.text)
+  if (rawCandidates.length === 0 && response.text.trim()) {
+    const retryInstructions = `${extractNewsletterLinksPrompt}\n\n【重要】上一次输出不是有效 JSON，请仅输出完整 JSON 数组，不要代码块或多余文字。`
+    const retryResponse = await createResponseText({
+      env,
+      model,
+      instructions: retryInstructions,
+      input,
+      maxOutputTokens,
+      responseMimeType: 'application/json',
+      responseSchema: newsletterLinkSchema,
+    })
+    if (rules?.debug) {
+      console.info('newsletter ai retry response', {
+        subject,
+        messageId,
+        receivedAt,
+        provider,
+        model,
+        outputLength: retryResponse.text.length,
+        finishReason: retryResponse.finishReason,
+        output: retryResponse.text,
+      })
+    }
+    rawCandidates = parseNewsletterLinks(retryResponse.text)
+  }
   const trackingCache = new Map<string, string>()
+  const resolveTrackingLinks = rules?.resolveTrackingLinks !== false
   let resolvedCount = 0
   let failedResolveCount = 0
 
-  const resolvedLinks = resolveTrackingLinks
-    ? await Promise.all(links.map(async (link) => {
-        const rawUrl = link.href
-        let resolvedHref = rawUrl
-        if (!link.unwrapped) {
-          const hostname = (() => {
-            try {
-              return new URL(rawUrl).hostname.toLowerCase()
-            }
-            catch {
-              return ''
-            }
-          })()
-          const isTrackingHost = trackingHostnames.some(keyword => hostname.includes(keyword))
-          if (isTrackingHost) {
-            resolvedHref = await resolveTrackingRedirect(rawUrl, trackingCache)
-            if (resolvedHref !== rawUrl) {
-              resolvedCount += 1
-            }
-            else {
-              failedResolveCount += 1
-            }
-          }
+  const normalizedCandidates = await Promise.all(rawCandidates.map(async (candidate) => {
+    const normalizedLink = normalizeUrl(candidate.link)
+    if (!normalizedLink) {
+      return null
+    }
+    const { href, unwrapped } = unwrapTrackingUrl(normalizedLink)
+    let resolved = href
+    if (resolveTrackingLinks && !unwrapped) {
+      const hostname = (() => {
+        try {
+          return new URL(href).hostname.toLowerCase()
         }
-        return { ...link, href: resolvedHref }
-      }))
-    : links
-
-  const filtered = resolvedLinks.filter((link) => {
-    if (!link.href) {
-      return false
-    }
-
-    const text = link.text || ''
-    const excludeText = [...defaultExcludeText, ...(rules?.excludeText || [])]
-    if (matchesAny(text, excludeText)) {
-      return false
-    }
-
-    return true
-  })
-
-  const uniqueByHref = new Map<string, typeof filtered[number]>()
-  for (const link of filtered) {
-    const existing = uniqueByHref.get(link.href)
-    if (!existing || (link.text && link.text.length > (existing.text || '').length)) {
-      uniqueByHref.set(link.href, link)
-    }
-  }
-  const deduped = Array.from(uniqueByHref.values())
-
-  const domainFiltered = deduped.filter((link) => {
-    if (!rules?.includeDomains && !rules?.excludeDomains) {
-      return true
-    }
-    try {
-      const hostname = new URL(link.href).hostname
-      if (rules.includeDomains && rules.includeDomains.length > 0) {
-        if (!rules.includeDomains.some(domain => hostname.includes(domain))) {
-          return false
+        catch {
+          return ''
+        }
+      })()
+      const isTrackingHost = trackingHostnames.some(keyword => hostname.includes(keyword))
+      if (isTrackingHost) {
+        resolved = await resolveTrackingRedirect(href, trackingCache)
+        if (resolved !== href) {
+          resolvedCount += 1
+        }
+        else {
+          failedResolveCount += 1
         }
       }
-      if (rules.excludeDomains && rules.excludeDomains.length > 0) {
-        if (rules.excludeDomains.some(domain => hostname.includes(domain))) {
-          return false
-        }
-      }
-      return true
     }
-    catch {
-      return false
+    return {
+      title: candidate.title ? normalizeText(candidate.title) : undefined,
+      link: resolved,
     }
-  })
-
-  const pathFiltered = domainFiltered.filter((link) => {
-    const excludePathKeywords = [...defaultExcludePathKeywords, ...(rules?.excludePathKeywords || [])]
-    if (!excludePathKeywords.length) {
-      return true
-    }
-    try {
-      const pathname = new URL(link.href).pathname.toLowerCase()
-      return !excludePathKeywords.some(keyword => pathname.includes(keyword.toLowerCase()))
-    }
-    catch {
-      return false
-    }
-  })
-
-  const minScore = rules?.minArticleScore ?? 2
-  const scored = pathFiltered.map(link => ({
-    ...link,
-    score: scoreArticleLink(link, rules),
   }))
 
-  const kept = scored.filter(link => link.score >= minScore)
+  const filtered = normalizedCandidates.filter((candidate): candidate is NewsletterLinkCandidate => {
+    if (!candidate?.link) {
+      return false
+    }
+    try {
+      return Boolean(new URL(candidate.link))
+    }
+    catch {
+      return false
+    }
+  })
+
+  const deduped = new Map<string, NewsletterLinkCandidate>()
+  for (const candidate of filtered) {
+    const key = getUrlKey(candidate.link)
+    if (!deduped.has(key)) {
+      deduped.set(key, candidate)
+    }
+  }
+
+  const results = Array.from(deduped.values()).slice(0, MAX_NEWSLETTER_LINKS)
 
   if (rules?.debug) {
-    const maxLinks = rules.debugMaxLinks ?? 20
-    console.info('newsletter link debug', {
-      subject: debug?.subject,
-      messageId: debug?.messageId,
-      total: links.length,
-      unwrapped: links.filter(link => link.unwrapped).length,
+    console.info('newsletter ai link debug', {
+      subject,
+      messageId,
+      receivedAt,
+      inputLength: content.length,
+      rawCount: rawCandidates.length,
       trackingResolved: resolvedCount,
       trackingResolveFailed: failedResolveCount,
-      afterTextFilter: filtered.length,
-      afterDedup: deduped.length,
-      afterDomainFilter: domainFiltered.length,
-      afterPathFilter: pathFiltered.length,
-      afterScoreFilter: kept.length,
-      minScore,
-    })
-    kept.slice(0, maxLinks).forEach((link) => {
-      console.info('newsletter link kept', {
-        text: link.text,
-        href: link.href,
-        score: link.score,
-        unwrapped: link.unwrapped,
-      })
+      afterFilter: filtered.length,
+      afterDedup: deduped.size,
+      finalCount: results.length,
+      provider,
+      model,
     })
   }
 
-  return kept
+  return results
 }
 
 async function fetchAccessToken(env: GmailEnv) {
@@ -578,7 +680,7 @@ export async function fetchGmailItems(
   const query = buildGmailQuery(source.label, windowStart, windowEnd)
   let maxMessages = source.maxMessages || 50
   if (env.NODE_ENV && env.NODE_ENV !== 'production') {
-    maxMessages = Math.min(maxMessages, 2)
+    maxMessages = Math.min(maxMessages, 3)
   }
 
   const messageRefs = await listMessages(userId, query, maxMessages, token)
@@ -592,12 +694,13 @@ export async function fetchGmailItems(
   for (const message of messages) {
     const html = extractHtml(message)
     if (!html) {
-      console.warn('gmail message missing html body', message.id)
+      console.warn('gmail message missing html body', { id: message.id })
       continue
     }
 
     const subject = getHeader(message.payload?.headers, 'Subject')
     const receivedAt = message.internalDate ? new Date(Number(message.internalDate)) : now
+    const receivedAtIso = receivedAt.toISOString()
     if (receivedAt < windowStart || receivedAt > windowEnd) {
       continue
     }
@@ -610,36 +713,77 @@ export async function fetchGmailItems(
     }
 
     const archiveLink = findArchiveLink(html)
+    let newsletterContent = ''
     if (archiveLink) {
       try {
-        const archiveHtml = await fetchHtml(archiveLink)
-        const archiveRules = { ...source.linkRules, resolveTrackingLinks: false }
-        const links = await extractLinks(archiveHtml, archiveRules, { subject, messageId: message.id })
-        if (links.length === 0) {
-          console.warn('newsletter archive has no matching links', { id: message.id, subject })
-          continue
-        }
-        links.forEach((link, index) => {
-          items.push({
-            id: `${message.id}:${index}`,
-            title: link.text || subject,
-            url: link.href,
-            hackerNewsUrl: link.href,
-            sourceName: source.name,
-            sourceUrl: source.url,
-            publishedAt: receivedAt.toISOString(),
-            sourceItemId: message.id,
-            sourceItemTitle: subject,
-          })
-        })
-        continue
+        newsletterContent = await getContentFromJinaWithRetry(archiveLink, 'markdown', {}, env.JINA_KEY)
       }
       catch (error) {
-        console.warn('failed to fetch archive html, skip newsletter', { error, id: message.id })
-        continue
+        console.warn('newsletter archive jina failed', { error, id: message.id, subject, receivedAt: receivedAtIso, archiveLink })
+      }
+
+      if (!newsletterContent) {
+        try {
+          const archiveHtml = await fetchHtml(archiveLink)
+          newsletterContent = await htmlToPlainText(archiveHtml)
+        }
+        catch (error) {
+          console.warn('failed to fetch archive html, fallback to email html', { error, id: message.id, subject, receivedAt: receivedAtIso })
+        }
       }
     }
-    console.warn('newsletter missing archive link, skip message', { id: message.id, subject })
+    else {
+      console.info('newsletter missing archive link, use email html', { id: message.id, subject, receivedAt: receivedAtIso })
+    }
+
+    if (!newsletterContent) {
+      newsletterContent = await htmlToPlainText(html)
+      if (source.linkRules?.debug) {
+        console.info('newsletter html cleaned content', {
+          subject,
+          messageId: message.id,
+          receivedAt: receivedAtIso,
+          length: newsletterContent.length,
+          content: newsletterContent,
+        })
+      }
+    }
+
+    if (!newsletterContent) {
+      console.warn('newsletter content is empty, skip message', { id: message.id, subject, receivedAt: receivedAtIso })
+      continue
+    }
+
+    try {
+      const links = await extractNewsletterLinksWithAi({
+        subject,
+        content: newsletterContent,
+        source,
+        env,
+        messageId: message.id,
+        receivedAt: receivedAtIso,
+      })
+      if (links.length === 0) {
+        console.warn('newsletter has no matching links', { id: message.id, subject, receivedAt: receivedAtIso })
+        continue
+      }
+      links.forEach((link, index) => {
+        items.push({
+          id: `${message.id}:${index}`,
+          title: link.title || subject,
+          url: link.link,
+          hackerNewsUrl: link.link,
+          sourceName: source.name,
+          sourceUrl: source.url,
+          publishedAt: receivedAt.toISOString(),
+          sourceItemId: message.id,
+          sourceItemTitle: subject,
+        })
+      })
+    }
+    catch (error) {
+      console.warn('newsletter ai extraction failed, skip message', { error, id: message.id, subject, receivedAt: receivedAtIso })
+    }
   }
 
   return items

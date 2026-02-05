@@ -23,7 +23,7 @@ function isTimeoutError(error: unknown) {
   return message.includes('timeout') || message.includes('timed out') || message.includes('aborted')
 }
 
-async function getContentFromJinaWithRetry(
+export async function getContentFromJinaWithRetry(
   url: string,
   format: 'html' | 'markdown',
   selector?: { include?: string, exclude?: string },

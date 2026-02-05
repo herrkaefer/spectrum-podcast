@@ -1,7 +1,10 @@
 import type { WorkflowEvent, WorkflowStep, WorkflowStepConfig } from 'cloudflare:workers'
-import { GoogleGenAI } from '@google/genai'
+import type { AiEnv } from './ai'
+
 import { WorkflowEntrypoint } from 'cloudflare:workers'
+
 import { podcastTitle } from '@/config'
+import { createResponseText, getAiProvider, getMaxTokens, getPrimaryModel, getThinkingModel } from './ai'
 import { introPrompt, summarizeBlogPrompt, summarizePodcastPrompt, summarizeStoryPrompt } from './prompt'
 import { getStoriesFromSources } from './sources'
 import synthesize, { buildGeminiTtsPrompt, synthesizeGeminiTTS } from './tts'
@@ -14,16 +17,7 @@ interface Params {
   windowHours?: number
 }
 
-interface Env extends CloudflareEnv {
-  OPENAI_BASE_URL?: string
-  OPENAI_API_KEY?: string
-  OPENAI_MODEL?: string
-  OPENAI_THINKING_MODEL?: string
-  OPENAI_MAX_TOKENS?: string
-  GEMINI_API_KEY?: string
-  GEMINI_MODEL?: string
-  GEMINI_THINKING_MODEL?: string
-  GEMINI_MAX_TOKENS?: string
+interface Env extends CloudflareEnv, AiEnv {
   JINA_KEY?: string
   GMAIL_CLIENT_ID?: string
   GMAIL_CLIENT_SECRET?: string
@@ -39,70 +33,6 @@ interface Env extends CloudflareEnv {
   WORKFLOW_TEST_INPUT?: string
   WORKFLOW_TEST_INSTRUCTIONS?: string
   WORKFLOW_TTS_INPUT?: string
-}
-
-interface ResponsesMessageContent {
-  type?: string
-  text?: string
-}
-
-interface ResponsesOutputItem {
-  type?: string
-  role?: string
-  content?: ResponsesMessageContent[]
-}
-
-interface ResponsesBody {
-  output_text?: string
-  output?: ResponsesOutputItem[]
-  usage?: unknown
-  status?: string
-  error?: { message?: string }
-}
-
-interface ResponseTextResult {
-  text: string
-  usage?: unknown
-  finishReason?: string
-}
-
-type AiProvider = 'openai' | 'gemini'
-
-const defaultOpenAIBaseUrl = 'https://api.openai.com/v1'
-
-function getAiProvider(env: Env): AiProvider {
-  const hasGeminiKey = Boolean(env.GEMINI_API_KEY?.trim())
-  const hasOpenAIKey = Boolean(env.OPENAI_API_KEY?.trim())
-  if (hasGeminiKey && !hasOpenAIKey) {
-    return 'gemini'
-  }
-  return 'openai'
-}
-
-function getPrimaryModel(env: Env, provider: AiProvider): string {
-  if (provider === 'gemini') {
-    if (!env.GEMINI_MODEL) {
-      throw new Error('GEMINI_MODEL is required when using Gemini API')
-    }
-    return env.GEMINI_MODEL
-  }
-  if (!env.OPENAI_MODEL) {
-    throw new Error('OPENAI_MODEL is required when using OpenAI API')
-  }
-  return env.OPENAI_MODEL
-}
-
-function getThinkingModel(env: Env, provider: AiProvider): string {
-  if (provider === 'gemini') {
-    return env.GEMINI_THINKING_MODEL || getPrimaryModel(env, provider)
-  }
-  return env.OPENAI_THINKING_MODEL || getPrimaryModel(env, provider)
-}
-
-function getMaxTokens(env: Env, provider: AiProvider): number {
-  const raw = provider === 'gemini' ? env.GEMINI_MAX_TOKENS : env.OPENAI_MAX_TOKENS
-  const parsed = Number.parseInt(raw || '4096')
-  return Number.isFinite(parsed) ? parsed : 4096
 }
 
 function formatError(error: unknown) {
@@ -201,115 +131,6 @@ function zonedTimeToUtc(dateKey: string, timeZone: string, hour: number, minute:
   const utcDate = new Date(Date.UTC(year, month - 1, day, hour, minute, second))
   const offset = getTimeZoneOffsetMs(utcDate, timeZone)
   return new Date(utcDate.getTime() + offset)
-}
-
-function buildResponsesUrl(baseUrl?: string): string {
-  const normalized = (baseUrl || defaultOpenAIBaseUrl).replace(/\/$/, '')
-  return `${normalized}/responses`
-}
-
-function extractOutputText(body: ResponsesBody): string {
-  if (typeof body.output_text === 'string') {
-    return body.output_text
-  }
-  if (!Array.isArray(body.output)) {
-    return ''
-  }
-  const texts: string[] = []
-  for (const item of body.output) {
-    if (!item || item.type !== 'message' || !Array.isArray(item.content)) {
-      continue
-    }
-    for (const content of item.content) {
-      if (content?.type === 'output_text' && typeof content.text === 'string') {
-        texts.push(content.text)
-      }
-      else if (content?.type === 'text' && typeof content.text === 'string') {
-        texts.push(content.text)
-      }
-    }
-  }
-  return texts.join('')
-}
-
-async function createResponseText(params: {
-  env: Env
-  model: string
-  instructions: string
-  input: string
-  maxOutputTokens?: number
-}): Promise<ResponseTextResult> {
-  const { env, model, instructions, input, maxOutputTokens } = params
-  const provider = getAiProvider(env)
-
-  if (provider === 'gemini') {
-    if (!env.GEMINI_API_KEY) {
-      throw new Error('GEMINI_API_KEY is required when using Gemini API')
-    }
-    const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY, vertexai: false })
-    const config: Record<string, unknown> = {
-      systemInstruction: instructions,
-    }
-    if (typeof maxOutputTokens === 'number' && Number.isFinite(maxOutputTokens)) {
-      config.maxOutputTokens = maxOutputTokens
-    }
-    const response = await ai.models.generateContent({
-      model,
-      contents: input,
-      config,
-    })
-    const text = response.text
-    if (!text) {
-      throw new Error('Gemini generateContent returned empty output')
-    }
-    return {
-      text,
-      usage: (response as { usageMetadata?: unknown }).usageMetadata,
-    }
-  }
-
-  if (!env.OPENAI_API_KEY) {
-    throw new Error('OPENAI_API_KEY is required when using OpenAI API')
-  }
-  const url = buildResponsesUrl(env.OPENAI_BASE_URL)
-  const body: Record<string, unknown> = {
-    model,
-    instructions,
-    input,
-  }
-  if (typeof maxOutputTokens === 'number' && Number.isFinite(maxOutputTokens)) {
-    body.max_output_tokens = maxOutputTokens
-  }
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${env.OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  })
-
-  if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(`OpenAI Responses API error: ${response.status} ${response.statusText} ${errorText}`)
-  }
-
-  const data = (await response.json()) as ResponsesBody
-  if (data.error?.message) {
-    throw new Error(`OpenAI Responses API error: ${data.error.message}`)
-  }
-
-  const text = extractOutputText(data)
-  if (!text) {
-    throw new Error('OpenAI Responses API returned empty output')
-  }
-
-  return {
-    text,
-    usage: data.usage,
-    finishReason: data.status,
-  }
 }
 
 const retryConfig: WorkflowStepConfig = {
@@ -505,32 +326,7 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
         return []
       }
 
-      if (!isDev) {
-        return topStories
-      }
-
-      const sourceFirstItem = new Map<string, Story>()
-      for (const story of topStories) {
-        const key = story.sourceName || story.sourceUrl || story.url || 'unknown'
-        if (!sourceFirstItem.has(key)) {
-          sourceFirstItem.set(key, story)
-        }
-      }
-
-      const allowedSourceItems = new Map<string, string>()
-      for (const [key, story] of sourceFirstItem.entries()) {
-        if (story.sourceItemId) {
-          allowedSourceItems.set(key, story.sourceItemId)
-        }
-      }
-
-      return topStories.filter((story) => {
-        const key = story.sourceName || story.sourceUrl || story.url || 'unknown'
-        if (!allowedSourceItems.has(key)) {
-          return sourceFirstItem.get(key) === story
-        }
-        return story.sourceItemId === allowedSourceItems.get(key)
-      })
+      return topStories
     })
 
     if (!stories.length) {

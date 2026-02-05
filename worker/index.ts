@@ -18,7 +18,7 @@ export default {
         params: {
           nowIso: isScheduled ? new Date(event.scheduledTime).toISOString() : now.toISOString(),
           windowMode: isScheduled ? 'calendar' : 'rolling',
-          windowHours: isScheduled ? undefined : 24,
+          windowHours: isScheduled ? undefined : 48,
         },
       })
 
