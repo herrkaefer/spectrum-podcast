@@ -9,6 +9,9 @@ import { concatAudioFiles, getStoryContent } from './utils'
 
 interface Params {
   today?: string
+  nowIso?: string
+  windowMode?: 'calendar' | 'rolling'
+  windowHours?: number
 }
 
 interface Env extends CloudflareEnv {
@@ -122,6 +125,82 @@ function formatError(error: unknown) {
     cause: err?.cause,
     data: err?.data,
   }
+}
+
+function buildTimeWindow(
+  now: Date,
+  mode: Params['windowMode'] | undefined,
+  hours: number,
+  timeZone: string,
+) {
+  if (mode === 'rolling') {
+    const end = now
+    const start = new Date(now.getTime() - hours * 60 * 60 * 1000)
+    return {
+      windowStart: start,
+      windowEnd: end,
+      windowDateKey: getDateKeyInTimeZone(end, timeZone),
+    }
+  }
+
+  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000)
+  const dateKey = getDateKeyInTimeZone(yesterday, timeZone)
+  return {
+    windowStart: zonedTimeToUtc(dateKey, timeZone, 0, 0, 0),
+    windowEnd: zonedTimeToUtc(dateKey, timeZone, 23, 59, 59),
+    windowDateKey: dateKey,
+  }
+}
+
+function getDateKeyInTimeZone(date: Date, timeZone: string) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date)
+
+  const year = parts.find(part => part.type === 'year')?.value || '0000'
+  const month = parts.find(part => part.type === 'month')?.value || '01'
+  const day = parts.find(part => part.type === 'day')?.value || '01'
+
+  return `${year}-${month}-${day}`
+}
+
+function getTimeZoneOffsetMs(date: Date, timeZone: string) {
+  const timeZoneParts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date)
+
+  const dateParts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'UTC',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date)
+
+  const getValue = (parts: Intl.DateTimeFormatPart[], type: string) => Number(parts.find(part => part.type === type)?.value || '0')
+
+  const tzTime = getValue(timeZoneParts, 'hour') * 3600
+    + getValue(timeZoneParts, 'minute') * 60
+    + getValue(timeZoneParts, 'second')
+  const utcTime = getValue(dateParts, 'hour') * 3600
+    + getValue(dateParts, 'minute') * 60
+    + getValue(dateParts, 'second')
+
+  return (utcTime - tzTime) * 1000
+}
+
+function zonedTimeToUtc(dateKey: string, timeZone: string, hour: number, minute: number, second: number) {
+  const [year, month, day] = dateKey.split('-').map(Number)
+  const utcDate = new Date(Date.UTC(year, month - 1, day, hour, minute, second))
+  const offset = getTimeZoneOffsetMs(utcDate, timeZone)
+  return new Date(utcDate.getTime() + offset)
 }
 
 function buildResponsesUrl(baseUrl?: string): string {
@@ -249,9 +328,17 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     const runEnv = this.env.NODE_ENV || 'production'
     const isDev = runEnv !== 'production'
     const breakTime = isDev ? '2 seconds' : '5 seconds'
-    const today = event.payload?.today || new Date().toISOString().split('T')[0]
-    const runDate = new Date(`${today}T23:59:59Z`)
-    const now = Number.isNaN(runDate.getTime()) ? new Date() : runDate
+    const payloadNow = event.payload?.nowIso ? new Date(event.payload.nowIso) : null
+    const todayFallback = event.payload?.today || new Date().toISOString().split('T')[0]
+    const runDate = new Date(`${todayFallback}T23:59:59Z`)
+    const now = payloadNow && !Number.isNaN(payloadNow.getTime())
+      ? payloadNow
+      : Number.isNaN(runDate.getTime()) ? new Date() : runDate
+    const windowMode = event.payload?.windowMode
+    const windowHours = event.payload?.windowHours ?? 24
+    const timeZone = 'America/Chicago'
+    const { windowStart, windowEnd, windowDateKey } = buildTimeWindow(now, windowMode, windowHours, timeZone)
+    const today = event.payload?.today || windowDateKey || todayFallback
     const skipTTS = this.env.SKIP_TTS === 'true'
     const ttsProvider = (this.env.TTS_PROVIDER || '').trim().toLowerCase()
     const useGeminiTTS = ttsProvider === 'gemini'
@@ -403,10 +490,19 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     }
 
     const stories = await step.do(`get stories ${today}`, retryConfig, async () => {
-      const topStories = await getStoriesFromSources({ now, env: this.env })
+      const topStories = await getStoriesFromSources({
+        now,
+        env: this.env,
+        window: {
+          start: windowStart,
+          end: windowEnd,
+          timeZone,
+        },
+      })
 
       if (!topStories.length) {
-        throw new Error('no stories found')
+        console.warn('no stories found, skip workflow run')
+        return []
       }
 
       if (!isDev) {
@@ -436,6 +532,11 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
         return story.sourceItemId === allowedSourceItems.get(key)
       })
     })
+
+    if (!stories.length) {
+      console.info('no stories found after filtering, exit workflow run')
+      return
+    }
 
     console.info('top stories', isDev ? stories : JSON.stringify(stories))
     console.info(`total stories: ${stories.length}`)

@@ -26,9 +26,9 @@
   },
   "triggers": {
     "crons": [
-      // Chicago 23:30 local time (UTC 04:30 or 05:30 depending on DST)
-      "30 4 * * *",
-      "30 5 * * *"
+      // Chicago 00:30 local time (UTC 05:30 or 06:30 depending on DST)
+      "30 5 * * *",
+      "30 6 * * *"
     ]
   },
   "keep_vars": true,

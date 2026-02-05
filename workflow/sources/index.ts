@@ -12,7 +12,7 @@ function getLookbackDays(source: SourceConfig, defaultLookbackDays: number) {
   return source.lookbackDays ?? defaultLookbackDays
 }
 
-export async function getStoriesFromSources(options?: { now?: Date, env?: CloudflareEnv }) {
+export async function getStoriesFromSources(options?: { now?: Date, env?: CloudflareEnv, window?: { start: Date, end: Date, timeZone: string } }) {
   const now = options?.now ?? new Date()
   const { sources, lookbackDays } = await loadSourceConfig()
   const enabledSources = sources.filter(isEnabled)
@@ -22,14 +22,14 @@ export async function getStoriesFromSources(options?: { now?: Date, env?: Cloudf
       const days = getLookbackDays(source, lookbackDays)
       switch (source.type) {
         case 'rss': {
-          return await fetchRssItems(source, now, days)
+          return await fetchRssItems(source, now, days, options?.window)
         }
         case 'gmail': {
           if (!options?.env) {
             console.warn('gmail source requires env, skip', source)
             return []
           }
-          return await fetchGmailItems(source, now, days, options.env)
+          return await fetchGmailItems(source, now, days, options.env, options?.window)
         }
         case 'url':
           return [

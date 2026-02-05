@@ -42,6 +42,10 @@ function isSameDayInTimeZone(publishedAt: Date, now: Date, timeZone: string) {
   return getDateKeyInTimeZone(publishedAt, timeZone) === getDateKeyInTimeZone(now, timeZone)
 }
 
+function isWithinWindow(publishedAt: Date, start: Date, end: Date) {
+  return publishedAt >= start && publishedAt <= end
+}
+
 function extractRssItems(xml: string) {
   const $ = cheerio.load(xml, { xmlMode: true })
   const items = $('item')
@@ -78,7 +82,12 @@ function normalizeItem(item: RssItem) {
   return { ...item, link: url }
 }
 
-export async function fetchRssItems(source: SourceConfig, now: Date, lookbackDays: number) {
+export async function fetchRssItems(
+  source: SourceConfig,
+  now: Date,
+  lookbackDays: number,
+  window?: { start: Date, end: Date, timeZone: string },
+) {
   const timeZone = 'America/Chicago'
 
   try {
@@ -98,6 +107,9 @@ export async function fetchRssItems(source: SourceConfig, now: Date, lookbackDay
         if (!publishedAt) {
           console.warn('rss item missing pubDate', { source: source.name, title: item.title })
           return false
+        }
+        if (window) {
+          return isWithinWindow(publishedAt, window.start, window.end)
         }
         return isSameDayInTimeZone(publishedAt, now, timeZone)
           && isWithinLookback(publishedAt, now, lookbackDays)

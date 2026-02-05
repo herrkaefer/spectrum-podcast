@@ -564,6 +564,7 @@ export async function fetchGmailItems(
   now: Date,
   lookbackDays: number,
   env: GmailEnv,
+  window?: { start: Date, end: Date, timeZone: string },
 ) {
   if (!source.label) {
     console.warn('gmail source missing label', source)
@@ -573,8 +574,8 @@ export async function fetchGmailItems(
   const userId = env.GMAIL_USER_EMAIL || 'me'
   const token = await fetchAccessToken(env)
   const { dateKey: targetDateKey, startUtc, endUtc } = getYesterdayRangeInChicago(now)
-  const windowStart = startUtc || new Date(now.getTime() - Math.max(lookbackDays, 2) * ONE_DAY_MS)
-  const windowEnd = endUtc || now
+  const windowStart = window?.start || startUtc || new Date(now.getTime() - Math.max(lookbackDays, 2) * ONE_DAY_MS)
+  const windowEnd = window?.end || endUtc || now
   const query = buildGmailQuery(source.label, windowStart, windowEnd)
   let maxMessages = source.maxMessages || 50
   if (env.NODE_ENV && env.NODE_ENV !== 'production') {
@@ -602,9 +603,11 @@ export async function fetchGmailItems(
       continue
     }
 
-    const receivedDateKey = getDateKeyInTimeZone(receivedAt, CHICAGO_TIMEZONE)
-    if (receivedDateKey !== targetDateKey) {
-      continue
+    if (!window) {
+      const receivedDateKey = getDateKeyInTimeZone(receivedAt, CHICAGO_TIMEZONE)
+      if (receivedDateKey !== targetDateKey) {
+        continue
+      }
     }
 
     const archiveLink = findArchiveLink(html)

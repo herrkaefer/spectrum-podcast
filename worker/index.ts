@@ -12,7 +12,15 @@ export default {
     console.info('trigger event by:', event)
 
     const createWorkflow = async () => {
-      const instance = await env.PODCAST_WORKFLOW.create()
+      const now = new Date()
+      const isScheduled = 'scheduledTime' in event
+      const instance = await env.PODCAST_WORKFLOW.create({
+        params: {
+          nowIso: isScheduled ? new Date(event.scheduledTime).toISOString() : now.toISOString(),
+          windowMode: isScheduled ? 'calendar' : 'rolling',
+          windowHours: isScheduled ? undefined : 24,
+        },
+      })
 
       const instanceDetails = {
         id: instance.id,
@@ -67,8 +75,8 @@ export default {
     const hour = Number(timeParts.find(part => part.type === 'hour')?.value || '0')
     const minute = Number(timeParts.find(part => part.type === 'minute')?.value || '0')
 
-    if (hour !== 23 || minute !== 30) {
-      console.info('skip schedule outside Chicago 23:30', { hour, minute })
+    if (hour !== 0 || minute !== 30) {
+      console.info('skip schedule outside Chicago 00:30', { hour, minute })
       return
     }
 
