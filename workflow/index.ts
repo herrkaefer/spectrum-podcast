@@ -35,6 +35,7 @@ interface Env extends CloudflareEnv {
   WORKFLOW_TEST_STEP?: string
   WORKFLOW_TEST_INPUT?: string
   WORKFLOW_TEST_INSTRUCTIONS?: string
+  WORKFLOW_TTS_INPUT?: string
 }
 
 interface ResponsesMessageContent {
@@ -99,6 +100,28 @@ function getMaxTokens(env: Env, provider: AiProvider): number {
   const raw = provider === 'gemini' ? env.GEMINI_MAX_TOKENS : env.OPENAI_MAX_TOKENS
   const parsed = Number.parseInt(raw || '4096')
   return Number.isFinite(parsed) ? parsed : 4096
+}
+
+function formatError(error: unknown) {
+  const err = error as {
+    name?: string
+    message?: string
+    stack?: string
+    cause?: unknown
+    status?: number
+    statusText?: string
+    response?: { status?: number, statusText?: string }
+    data?: unknown
+  }
+  return {
+    name: err?.name,
+    message: err?.message,
+    status: err?.status ?? err?.response?.status,
+    statusText: err?.statusText ?? err?.response?.statusText,
+    stack: err?.stack,
+    cause: err?.cause,
+    data: err?.data,
+  }
 }
 
 function buildResponsesUrl(baseUrl?: string): string {
@@ -256,12 +279,18 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
         }
 
         if (testStep === 'tts') {
-          const sampleInput = this.env.WORKFLOW_TEST_INPUT
+          const sampleInput = this.env.WORKFLOW_TTS_INPUT
+            || this.env.WORKFLOW_TEST_INPUT
             || [
               '女：Hello 大家好，欢迎收听测试播客。',
               '男：大家好，我是老冯。今天我们用一小段对话来测试 TTS。',
               '女：如果你能听到自然的男女声切换，说明流程是通的。',
             ].join('\n')
+
+          console.info('TTS test input', {
+            chars: sampleInput.length,
+            preview: sampleInput.slice(0, 200),
+          })
 
           if (skipTTS) {
             return 'skip TTS enabled, skip audio generation'
@@ -521,57 +550,123 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     const podcastKeyBase = `${today.replaceAll('-', '/')}/${runEnv}/hacker-podcast-${today}`
     let podcastKey = `${podcastKeyBase}.mp3`
 
-    const conversations = podcastContent
+    const ttsInputOverride = this.env.WORKFLOW_TTS_INPUT?.trim()
+    if (ttsInputOverride) {
+      console.info('TTS input overridden by WORKFLOW_TTS_INPUT')
+    }
+    const ttsSourceText = ttsInputOverride || podcastContent
+
+    const conversations = ttsSourceText
       .split('\n')
       .map(line => line.trim())
       .filter(Boolean)
     const dialogLines = conversations.filter(line => line.startsWith('男') || line.startsWith('女'))
+
+    console.info('TTS input stats', {
+      hasOverride: Boolean(ttsInputOverride),
+      chars: ttsSourceText.length,
+      lines: conversations.length,
+      dialogLines: dialogLines.length,
+      preview: ttsSourceText.slice(0, 200),
+    })
 
     if (skipTTS) {
       console.info('skip TTS enabled, skip audio generation')
     }
     else if (useGeminiTTS) {
       const prompt = buildGeminiTtsPrompt(dialogLines)
-      const { audio, extension } = await step.do('create gemini podcast audio', { ...retryConfig, timeout: '5 minutes' }, async () => {
-        return await synthesizeGeminiTTS(prompt, this.env)
+      console.info('Gemini TTS input', {
+        totalLines: dialogLines.length,
+        promptChars: prompt.length,
       })
-
-      if (!audio.size) {
-        throw new Error('podcast audio size is 0')
-      }
-
-      podcastKey = `${podcastKeyBase}.${extension}`
-      await this.env.PODCAST_R2.put(podcastKey, audio)
-
-      const podcastAudioUrl = `${this.env.PODCAST_R2_BUCKET_URL}/${podcastKey}?t=${Date.now()}`
-      console.info('podcast audio url', podcastAudioUrl)
-    }
-    else {
-      for (const [index, conversation] of conversations.entries()) {
-        await step.do(`create audio ${index}: ${conversation.substring(0, 20)}...`, { ...retryConfig, timeout: '5 minutes' }, async () => {
-          if (
-            !(conversation.startsWith('男') || conversation.startsWith('女'))
-            || !conversation.substring(2).trim()
-          ) {
-            console.warn('conversation is not valid', conversation)
-            return conversation
-          }
-
-          console.info('create conversation audio', conversation)
-          const audio = await synthesize(conversation.substring(2), conversation[0], this.env)
-
+      try {
+        const result = await step.do('create gemini podcast audio', { ...retryConfig, timeout: '5 minutes' }, async () => {
+          const { audio, extension } = await synthesizeGeminiTTS(prompt, this.env)
           if (!audio.size) {
             throw new Error('podcast audio size is 0')
           }
-
-          const audioKey = `tmp/${podcastKey}-${index}.mp3`
-          const audioUrl = `${this.env.PODCAST_R2_BUCKET_URL}/${audioKey}?t=${Date.now()}`
-
-          await this.env.PODCAST_R2.put(audioKey, audio)
-
-          this.env.PODCAST_KV.put(`tmp:${event.instanceId}:audio:${index}`, audioUrl, { expirationTtl: 3600 })
-          return audioUrl
+          const finalKey = `${podcastKeyBase}.${extension}`
+          try {
+            await this.env.PODCAST_R2.put(finalKey, audio)
+          }
+          catch (error) {
+            console.error('Gemini TTS upload to R2 failed', {
+              key: finalKey,
+              error: formatError(error),
+            })
+            throw error
+          }
+          const audioUrl = `${this.env.PODCAST_R2_BUCKET_URL}/${finalKey}?t=${Date.now()}`
+          return { podcastKey: finalKey, audioUrl }
         })
+
+        podcastKey = result.podcastKey
+        console.info('podcast audio url', result.audioUrl)
+      }
+      catch (error) {
+        console.error('Gemini TTS failed', {
+          error: formatError(error),
+          promptPreview: prompt.slice(0, 400),
+        })
+        throw error
+      }
+    }
+    else {
+      for (const [index, conversation] of conversations.entries()) {
+        try {
+          await step.do(`create audio ${index}: ${conversation.substring(0, 20)}...`, { ...retryConfig, timeout: '5 minutes' }, async () => {
+            if (
+              !(conversation.startsWith('男') || conversation.startsWith('女'))
+              || !conversation.substring(2).trim()
+            ) {
+              console.warn('conversation is not valid', conversation)
+              return conversation
+            }
+
+            console.info('create conversation audio', conversation)
+            const audio = await synthesize(conversation.substring(2), conversation[0], this.env)
+
+            if (!audio.size) {
+              throw new Error('podcast audio size is 0')
+            }
+
+            const audioKey = `tmp/${podcastKey}-${index}.mp3`
+            const audioUrl = `${this.env.PODCAST_R2_BUCKET_URL}/${audioKey}?t=${Date.now()}`
+
+            try {
+              await this.env.PODCAST_R2.put(audioKey, audio)
+            }
+            catch (error) {
+              console.error('TTS upload to R2 failed', {
+                index,
+                key: audioKey,
+                error: formatError(error),
+              })
+              throw error
+            }
+
+            try {
+              await this.env.PODCAST_KV.put(`tmp:${event.instanceId}:audio:${index}`, audioUrl, { expirationTtl: 3600 })
+            }
+            catch (error) {
+              console.error('TTS write to KV failed', {
+                index,
+                key: `tmp:${event.instanceId}:audio:${index}`,
+                error: formatError(error),
+              })
+              throw error
+            }
+            return audioUrl
+          })
+        }
+        catch (error) {
+          console.error('TTS line failed', {
+            index,
+            conversation,
+            error: formatError(error),
+          })
+          throw error
+        }
       }
     }
 
@@ -580,9 +675,19 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
       : await step.do('collect all audio files', retryConfig, async () => {
           const audioUrls: string[] = []
           for (const [index] of conversations.entries()) {
-            const audioUrl = await this.env.PODCAST_KV.get(`tmp:${event.instanceId}:audio:${index}`)
-            if (audioUrl) {
-              audioUrls.push(audioUrl)
+            try {
+              const audioUrl = await this.env.PODCAST_KV.get(`tmp:${event.instanceId}:audio:${index}`)
+              if (audioUrl) {
+                audioUrls.push(audioUrl)
+              }
+            }
+            catch (error) {
+              console.error('collect TTS audio url failed', {
+                index,
+                key: `tmp:${event.instanceId}:audio:${index}`,
+                error: formatError(error),
+              })
+              throw error
             }
           }
           return audioUrls
@@ -596,7 +701,16 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
         }
 
         const blob = await concatAudioFiles(audioFiles, this.env.BROWSER, { workerUrl: this.env.PODCAST_WORKER_URL })
-        await this.env.PODCAST_R2.put(podcastKey, blob)
+        try {
+          await this.env.PODCAST_R2.put(podcastKey, blob)
+        }
+        catch (error) {
+          console.error('concat audio upload to R2 failed', {
+            key: podcastKey,
+            error: formatError(error),
+          })
+          throw error
+        }
 
         const podcastAudioUrl = `${this.env.PODCAST_R2_BUCKET_URL}/${podcastKey}?t=${Date.now()}`
         console.info('podcast audio url', podcastAudioUrl)
@@ -607,16 +721,25 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     console.info('save podcast to r2 success')
 
     await step.do('save content to kv', retryConfig, async () => {
-      await this.env.PODCAST_KV.put(contentKey, JSON.stringify({
-        date: today,
-        title: `${podcastTitle} ${today}`,
-        stories,
-        podcastContent,
-        blogContent,
-        introContent,
-        audio: skipTTS ? '' : podcastKey,
-        updatedAt: Date.now(),
-      }))
+      try {
+        await this.env.PODCAST_KV.put(contentKey, JSON.stringify({
+          date: today,
+          title: `${podcastTitle} ${today}`,
+          stories,
+          podcastContent,
+          blogContent,
+          introContent,
+          audio: skipTTS ? '' : podcastKey,
+          updatedAt: Date.now(),
+        }))
+      }
+      catch (error) {
+        console.error('save content to KV failed', {
+          key: contentKey,
+          error: formatError(error),
+        })
+        throw error
+      }
 
       return introContent
     })
@@ -640,7 +763,11 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
         }
       }
 
-      await Promise.all(deletePromises).catch(console.error)
+      await Promise.all(deletePromises).catch((error) => {
+        console.error('cleanup kv failed', {
+          error: formatError(error),
+        })
+      })
 
       if (!skipTTS && !useGeminiTTS) {
         for (const index of audioFiles.keys()) {
@@ -651,7 +778,10 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
             ])
           }
           catch (error) {
-            console.error('delete temp files failed', error)
+            console.error('delete temp files failed', {
+              key: `tmp/${podcastKey}-${index}.mp3`,
+              error: formatError(error),
+            })
           }
         }
       }
