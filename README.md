@@ -108,7 +108,7 @@ pnpx wrangler secret put NEXT_STATIC_HOST # 绑定域名后，修改为绑定域
 ```bash
 # 记得恢复注释：wrangler.json 中的 workflows 相关配置
 pnpm deploy:worker
-pnpm deploy
+pnpm run deploy
 ```
 
 ## 致谢
