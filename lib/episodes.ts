@@ -10,6 +10,20 @@ function buildAudioUrl(staticHost: string, audioPath: string, updatedAt?: number
   return updatedAt ? `${base}?t=${updatedAt}` : base
 }
 
+function getAudioMimeType(audioPath: string): string {
+  const normalized = (audioPath || '').split('?')[0].toLowerCase()
+  if (normalized.endsWith('.wav')) {
+    return 'audio/wav'
+  }
+  if (normalized.endsWith('.ogg')) {
+    return 'audio/ogg'
+  }
+  if (normalized.endsWith('.webm')) {
+    return 'audio/webm'
+  }
+  return 'audio/mpeg'
+}
+
 function buildReferencesSection(stories?: Story[]): string {
   if (!stories || stories.length === 0) {
     return ''
@@ -65,7 +79,7 @@ export function buildEpisodeFromArticle(
     published: article.date,
     audio: {
       src: buildAudioUrl(staticHost, article.audio, article.updatedAt),
-      type: 'audio/mpeg',
+      type: getAudioMimeType(article.audio),
     },
     summary: article.introContent,
     stories: article.stories,

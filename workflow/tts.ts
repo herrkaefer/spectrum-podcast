@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer'
 import { synthesize } from '@echristian/edge-tts'
+import { GoogleGenAI } from '@google/genai'
 import { $fetch } from 'ofetch'
 
 interface Env extends CloudflareEnv {
@@ -8,9 +9,16 @@ interface Env extends CloudflareEnv {
   TTS_API_ID?: string
   TTS_API_KEY?: string
   TTS_MODEL?: string
+  GEMINI_API_KEY?: string
   MAN_VOICE_ID?: string
   WOMAN_VOICE_ID?: string
   AUDIO_SPEED?: string
+}
+
+interface GeminiAudioResult {
+  audio: Blob
+  extension: string
+  mimeType: string
 }
 
 async function edgeTTS(text: string, gender: string, env: Env) {
@@ -109,6 +117,76 @@ async function murfTTS(text: string, gender: string, env: Env) {
   throw new Error(`Failed to fetch audio: ${result.statusText}`)
 }
 
+export function buildGeminiTtsPrompt(lines: string[]): string {
+  const cleaned = lines
+    .map(line => line.trim())
+    .filter(line => line && (line.startsWith('男') || line.startsWith('女')))
+  if (!cleaned.length) {
+    throw new Error('Gemini TTS prompt is empty: no valid speaker lines found')
+  }
+  return [
+    '请用中文播报以下播客对话，语气自然、节奏流畅、音量稳定。',
+    ...cleaned,
+  ].join('\n')
+}
+
+export async function synthesizeGeminiTTS(text: string, env: Env): Promise<GeminiAudioResult> {
+  if (!env.GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY is required when using Gemini TTS')
+  }
+
+  const model = env.TTS_MODEL || 'gemini-2.5-flash-preview-tts'
+  const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY })
+  const response = await ai.models.generateContent({
+    model,
+    contents: [{ parts: [{ text }] }],
+    config: {
+      responseModalities: ['AUDIO'],
+      speechConfig: {
+        multiSpeakerVoiceConfig: {
+          speakerVoiceConfigs: [
+            {
+              speaker: '女',
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: env.WOMAN_VOICE_ID || 'Zephyr',
+                },
+              },
+            },
+            {
+              speaker: '男',
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: env.MAN_VOICE_ID || 'Puck',
+                },
+              },
+            },
+          ],
+        },
+      },
+    },
+  })
+
+  const inlineData = extractInlineData(response)
+  if (!inlineData?.data) {
+    throw new Error('Gemini TTS returned empty audio data')
+  }
+
+  const mimeType = inlineData.mimeType || 'audio/wav'
+  let buffer = Buffer.from(inlineData.data, 'base64')
+  let extension = getExtensionFromMime(mimeType)
+  let finalMimeType = mimeType
+
+  if (!extension) {
+    extension = 'wav'
+    buffer = convertToWav(buffer, mimeType)
+    finalMimeType = 'audio/wav'
+  }
+
+  const audio = new Blob([buffer], { type: finalMimeType })
+  return { audio, extension, mimeType: finalMimeType }
+}
+
 export default function (text: string, gender: string, env: Env) {
   console.info('TTS_PROVIDER', env.TTS_PROVIDER)
   switch (env.TTS_PROVIDER) {
@@ -116,7 +194,105 @@ export default function (text: string, gender: string, env: Env) {
       return minimaxTTS(text, gender, env)
     case 'murf':
       return murfTTS(text, gender, env)
+    case 'gemini':
+      throw new Error('Gemini TTS only supports full podcast synthesis, not per-line synthesis')
     default:
       return edgeTTS(text, gender, env)
   }
+}
+
+function extractInlineData(response: { candidates?: { content?: { parts?: { inlineData?: { data?: string, mimeType?: string } }[] } }[] }) {
+  const parts = response.candidates?.[0]?.content?.parts
+  if (!parts) {
+    return null
+  }
+  for (const part of parts) {
+    if (part?.inlineData?.data) {
+      return part.inlineData
+    }
+  }
+  return null
+}
+
+function getExtensionFromMime(mimeType: string) {
+  const [fileType] = mimeType.split(';').map(part => part.trim())
+  if (!fileType) {
+    return ''
+  }
+  const [, subtype] = fileType.split('/')
+  if (!subtype) {
+    return ''
+  }
+  if (subtype === 'wav' || subtype === 'x-wav') {
+    return 'wav'
+  }
+  if (subtype === 'mpeg') {
+    return 'mp3'
+  }
+  if (subtype === 'ogg') {
+    return 'ogg'
+  }
+  if (subtype === 'webm') {
+    return 'webm'
+  }
+  return ''
+}
+
+function convertToWav(buffer: Buffer, mimeType: string) {
+  const options = parseMimeType(mimeType)
+  const wavHeader = createWavHeader(buffer.length, options)
+  return Buffer.concat([wavHeader, buffer])
+}
+
+function parseMimeType(mimeType: string) {
+  const [fileType, ...params] = mimeType.split(';').map(part => part.trim())
+  const [, format] = fileType.split('/')
+
+  const options = {
+    numChannels: 1,
+    sampleRate: 24000,
+    bitsPerSample: 16,
+  }
+
+  if (format && format.startsWith('L')) {
+    const bits = Number.parseInt(format.slice(1), 10)
+    if (!Number.isNaN(bits)) {
+      options.bitsPerSample = bits
+    }
+  }
+
+  for (const param of params) {
+    const [key, value] = param.split('=').map(part => part.trim())
+    if (key === 'rate') {
+      const rate = Number.parseInt(value, 10)
+      if (!Number.isNaN(rate)) {
+        options.sampleRate = rate
+      }
+    }
+  }
+
+  return options
+}
+
+function createWavHeader(dataLength: number, options: { numChannels: number, sampleRate: number, bitsPerSample: number }) {
+  const { numChannels, sampleRate, bitsPerSample } = options
+  const byteRate = sampleRate * numChannels * bitsPerSample / 8
+  const blockAlign = numChannels * bitsPerSample / 8
+  const buffer = Buffer.alloc(44)
+
+  buffer.write('RIFF', 0)
+  buffer.writeUInt32LE(36 + dataLength, 4)
+  buffer.write('WAVE', 8)
+  buffer.write('fmt ', 12)
+  buffer.writeUInt32LE(16, 16)
+  buffer.writeUInt16LE(1, 20)
+  buffer.writeUInt16LE(numChannels, 22)
+  buffer.writeUInt32LE(sampleRate, 24)
+  buffer.writeUInt32LE(byteRate, 28)
+  buffer.writeUInt16LE(blockAlign, 32)
+  buffer.writeUInt16LE(bitsPerSample, 34)
+  buffer.write('data', 36)
+  buffer.writeUInt32LE(dataLength, 40)
+
+  return buffer
 }

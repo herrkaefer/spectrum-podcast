@@ -11,6 +11,18 @@ function getErrorStatus(error: unknown) {
   return err?.response?.status ?? err?.status
 }
 
+function isTimeoutError(error: unknown) {
+  const err = error as { name?: string, code?: string, cause?: { name?: string, code?: string }, message?: string }
+  if (err?.name === 'TimeoutError' || err?.cause?.name === 'TimeoutError') {
+    return true
+  }
+  if (err?.code === 'ETIMEDOUT' || err?.cause?.code === 'ETIMEDOUT') {
+    return true
+  }
+  const message = err?.message?.toLowerCase() || ''
+  return message.includes('timeout') || message.includes('timed out') || message.includes('aborted')
+}
+
 async function getContentFromJinaWithRetry(
   url: string,
   format: 'html' | 'markdown',
@@ -27,10 +39,12 @@ async function getContentFromJinaWithRetry(
     }
     catch (error) {
       const status = getErrorStatus(error)
-      if (status !== 429 || attempt >= retryLimit) {
+      const timeout = isTimeoutError(error)
+      if ((status !== 429 && !timeout) || attempt >= retryLimit) {
         throw error
       }
-      console.warn(`Jina rate limited (429), retrying in ${retryDelayMs}ms`, { url, attempt: attempt + 1 })
+      const reason = status === 429 ? 'rate limited (429)' : 'timeout'
+      console.warn(`Jina ${reason}, retrying in ${retryDelayMs}ms`, { url, attempt: attempt + 1 })
       await sleep(retryDelayMs)
       retryDelayMs *= 2
     }

@@ -10,6 +10,20 @@ const md = markdownit()
 
 export const revalidate = 3600
 
+function getAudioMimeType(audioPath: string): string {
+  const normalized = (audioPath || '').split('?')[0].toLowerCase()
+  if (normalized.endsWith('.wav')) {
+    return 'audio/wav'
+  }
+  if (normalized.endsWith('.ogg')) {
+    return 'audio/ogg'
+  }
+  if (normalized.endsWith('.webm')) {
+    return 'audio/webm'
+  }
+  return 'audio/mpeg'
+}
+
 export async function GET() {
   const baseUrl = process.env.NEXT_PUBLIC_BASE_URL ?? ''
 
@@ -72,7 +86,7 @@ export async function GET() {
       date: new Date(post.updatedAt || post.date),
       enclosure: {
         url: `${env.NEXT_STATIC_HOST}/${post.audio}?t=${post.updatedAt}`,
-        type: 'audio/mpeg',
+        type: getAudioMimeType(post.audio),
         size: audioInfo?.size,
       },
     })

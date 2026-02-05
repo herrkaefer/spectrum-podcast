@@ -4,7 +4,7 @@ import { WorkflowEntrypoint } from 'cloudflare:workers'
 import { podcastTitle } from '@/config'
 import { introPrompt, summarizeBlogPrompt, summarizePodcastPrompt, summarizeStoryPrompt } from './prompt'
 import { getStoriesFromSources } from './sources'
-import synthesize from './tts'
+import synthesize, { buildGeminiTtsPrompt, synthesizeGeminiTTS } from './tts'
 import { concatAudioFiles, getStoryContent } from './utils'
 
 interface Params {
@@ -230,6 +230,8 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     const runDate = new Date(`${today}T23:59:59Z`)
     const now = Number.isNaN(runDate.getTime()) ? new Date() : runDate
     const skipTTS = this.env.SKIP_TTS === 'true'
+    const ttsProvider = (this.env.TTS_PROVIDER || '').trim().toLowerCase()
+    const useGeminiTTS = ttsProvider === 'gemini'
     const aiProvider = getAiProvider(this.env)
     const maxTokens = getMaxTokens(this.env, aiProvider)
     const primaryModel = getPrimaryModel(this.env, aiProvider)
@@ -251,6 +253,60 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
             input: testInput,
             maxOutputTokens: maxTokens,
           })).text
+        }
+
+        if (testStep === 'tts') {
+          const sampleInput = this.env.WORKFLOW_TEST_INPUT
+            || [
+              '女：Hello 大家好，欢迎收听测试播客。',
+              '男：大家好，我是老冯。今天我们用一小段对话来测试 TTS。',
+              '女：如果你能听到自然的男女声切换，说明流程是通的。',
+            ].join('\n')
+
+          if (skipTTS) {
+            return 'skip TTS enabled, skip audio generation'
+          }
+
+          if (useGeminiTTS) {
+            const lines = sampleInput
+              .split('\n')
+              .map(line => line.trim())
+              .filter(Boolean)
+            const prompt = buildGeminiTtsPrompt(lines)
+            const { audio, extension } = await synthesizeGeminiTTS(prompt, this.env)
+            if (!audio.size) {
+              throw new Error('podcast audio size is 0')
+            }
+            const audioKey = `tmp:${event.instanceId}:tts-test.${extension}`
+            await this.env.PODCAST_R2.put(audioKey, audio)
+            const audioUrl = `${this.env.PODCAST_R2_BUCKET_URL}/${audioKey}?t=${Date.now()}`
+            console.info('tts test audio url', audioUrl)
+            return audioUrl
+          }
+
+          const conversations = sampleInput
+            .split('\n')
+            .map(line => line.trim())
+            .filter(Boolean)
+          const audioUrls: string[] = []
+          for (const [index, conversation] of conversations.entries()) {
+            if (
+              !(conversation.startsWith('男') || conversation.startsWith('女'))
+              || !conversation.substring(2).trim()
+            ) {
+              console.warn('conversation is not valid', conversation)
+              continue
+            }
+            const audio = await synthesize(conversation.substring(2), conversation[0], this.env)
+            if (!audio.size) {
+              throw new Error('podcast audio size is 0')
+            }
+            const audioKey = `tmp:${event.instanceId}:tts-test-${index}.mp3`
+            await this.env.PODCAST_R2.put(audioKey, audio)
+            const audioUrl = `${this.env.PODCAST_R2_BUCKET_URL}/${audioKey}?t=${Date.now()}`
+            audioUrls.push(audioUrl)
+          }
+          return `Generated ${audioUrls.length} audio files`
         }
 
         if (testStep === 'story') {
@@ -462,12 +518,33 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     })
 
     const contentKey = `content:${runEnv}:hacker-podcast:${today}`
-    const podcastKey = `${today.replaceAll('-', '/')}/${runEnv}/hacker-podcast-${today}.mp3`
+    const podcastKeyBase = `${today.replaceAll('-', '/')}/${runEnv}/hacker-podcast-${today}`
+    let podcastKey = `${podcastKeyBase}.mp3`
 
-    const conversations = podcastContent.split('\n').filter(Boolean)
+    const conversations = podcastContent
+      .split('\n')
+      .map(line => line.trim())
+      .filter(Boolean)
+    const dialogLines = conversations.filter(line => line.startsWith('男') || line.startsWith('女'))
 
     if (skipTTS) {
       console.info('skip TTS enabled, skip audio generation')
+    }
+    else if (useGeminiTTS) {
+      const prompt = buildGeminiTtsPrompt(dialogLines)
+      const { audio, extension } = await step.do('create gemini podcast audio', { ...retryConfig, timeout: '5 minutes' }, async () => {
+        return await synthesizeGeminiTTS(prompt, this.env)
+      })
+
+      if (!audio.size) {
+        throw new Error('podcast audio size is 0')
+      }
+
+      podcastKey = `${podcastKeyBase}.${extension}`
+      await this.env.PODCAST_R2.put(podcastKey, audio)
+
+      const podcastAudioUrl = `${this.env.PODCAST_R2_BUCKET_URL}/${podcastKey}?t=${Date.now()}`
+      console.info('podcast audio url', podcastAudioUrl)
     }
     else {
       for (const [index, conversation] of conversations.entries()) {
@@ -498,7 +575,7 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
       }
     }
 
-    const audioFiles = skipTTS
+    const audioFiles = skipTTS || useGeminiTTS
       ? []
       : await step.do('collect all audio files', retryConfig, async () => {
           const audioUrls: string[] = []
@@ -511,7 +588,7 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
           return audioUrls
         })
 
-    if (!skipTTS) {
+    if (!skipTTS && !useGeminiTTS) {
       await step.do('concat audio files', retryConfig, async () => {
         if (!this.env.BROWSER) {
           console.warn('browser is not configured, skip concat audio files')
@@ -555,7 +632,7 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
         deletePromises.push(this.env.PODCAST_KV.delete(storyKey))
       }
 
-      if (!skipTTS) {
+      if (!skipTTS && !useGeminiTTS) {
         // Clean up audio temporary data
         for (const [index] of conversations.entries()) {
           const audioKey = `tmp:${event.instanceId}:audio:${index}`
@@ -565,7 +642,7 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
 
       await Promise.all(deletePromises).catch(console.error)
 
-      if (!skipTTS) {
+      if (!skipTTS && !useGeminiTTS) {
         for (const index of audioFiles.keys()) {
           try {
             await Promise.any([
