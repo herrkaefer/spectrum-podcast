@@ -26,7 +26,7 @@
 - Next.js 应用框架
 - Cloudflare Workers 部署和运行环境
 - TTS 语音合成
-- OpenAI API 内容生成
+- OpenAI / Gemini API 内容生成
 - Tailwind CSS 样式处理
 - shadcn-ui 组件库
 
@@ -63,8 +63,15 @@ PODCAST_R2_BUCKET_URL=https://your-bucket-url
 OPENAI_API_KEY=your_api_key
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4.1
+GEMINI_API_KEY=your_gemini_key
+GEMINI_MODEL=gemini-2.0-flash
 
 ```
+
+> 说明：
+>
+> - 如果只配置 `GEMINI_API_KEY` 且未配置 `OPENAI_API_KEY`，工作流会使用 Gemini API。
+> - Gemini 可选配置：`GEMINI_THINKING_MODEL`、`GEMINI_MAX_TOKENS`。
 
 3. 启动开发服务器:
 
@@ -98,6 +105,10 @@ pnpx wrangler secret put --cwd worker PODCAST_R2_BUCKET_URL
 pnpx wrangler secret put --cwd worker OPENAI_API_KEY
 pnpx wrangler secret put --cwd worker OPENAI_BASE_URL
 pnpx wrangler secret put --cwd worker OPENAI_MODEL
+pnpx wrangler secret put --cwd worker GEMINI_API_KEY
+pnpx wrangler secret put --cwd worker GEMINI_MODEL
+pnpx wrangler secret put --cwd worker GEMINI_THINKING_MODEL
+pnpx wrangler secret put --cwd worker GEMINI_MAX_TOKENS
 
 # 更新 Web 程序的私有变量
 pnpx wrangler secret put NODE_ENV # Next.JS 环境，建议 production

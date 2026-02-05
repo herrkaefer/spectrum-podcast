@@ -1,4 +1,5 @@
 import type { WorkflowEvent, WorkflowStep, WorkflowStepConfig } from 'cloudflare:workers'
+import { GoogleGenAI } from '@google/genai'
 import { WorkflowEntrypoint } from 'cloudflare:workers'
 import { podcastTitle } from '@/config'
 import { introPrompt, summarizeBlogPrompt, summarizePodcastPrompt, summarizeStoryPrompt } from './prompt'
@@ -11,11 +12,15 @@ interface Params {
 }
 
 interface Env extends CloudflareEnv {
-  OPENAI_BASE_URL: string
-  OPENAI_API_KEY: string
-  OPENAI_MODEL: string
+  OPENAI_BASE_URL?: string
+  OPENAI_API_KEY?: string
+  OPENAI_MODEL?: string
   OPENAI_THINKING_MODEL?: string
   OPENAI_MAX_TOKENS?: string
+  GEMINI_API_KEY?: string
+  GEMINI_MODEL?: string
+  GEMINI_THINKING_MODEL?: string
+  GEMINI_MAX_TOKENS?: string
   JINA_KEY?: string
   GMAIL_CLIENT_ID?: string
   GMAIL_CLIENT_SECRET?: string
@@ -57,7 +62,44 @@ interface ResponseTextResult {
   finishReason?: string
 }
 
+type AiProvider = 'openai' | 'gemini'
+
 const defaultOpenAIBaseUrl = 'https://api.openai.com/v1'
+
+function getAiProvider(env: Env): AiProvider {
+  const hasGeminiKey = Boolean(env.GEMINI_API_KEY?.trim())
+  const hasOpenAIKey = Boolean(env.OPENAI_API_KEY?.trim())
+  if (hasGeminiKey && !hasOpenAIKey) {
+    return 'gemini'
+  }
+  return 'openai'
+}
+
+function getPrimaryModel(env: Env, provider: AiProvider): string {
+  if (provider === 'gemini') {
+    if (!env.GEMINI_MODEL) {
+      throw new Error('GEMINI_MODEL is required when using Gemini API')
+    }
+    return env.GEMINI_MODEL
+  }
+  if (!env.OPENAI_MODEL) {
+    throw new Error('OPENAI_MODEL is required when using OpenAI API')
+  }
+  return env.OPENAI_MODEL
+}
+
+function getThinkingModel(env: Env, provider: AiProvider): string {
+  if (provider === 'gemini') {
+    return env.GEMINI_THINKING_MODEL || getPrimaryModel(env, provider)
+  }
+  return env.OPENAI_THINKING_MODEL || getPrimaryModel(env, provider)
+}
+
+function getMaxTokens(env: Env, provider: AiProvider): number {
+  const raw = provider === 'gemini' ? env.GEMINI_MAX_TOKENS : env.OPENAI_MAX_TOKENS
+  const parsed = Number.parseInt(raw || '4096')
+  return Number.isFinite(parsed) ? parsed : 4096
+}
 
 function buildResponsesUrl(baseUrl?: string): string {
   const normalized = (baseUrl || defaultOpenAIBaseUrl).replace(/\/$/, '')
@@ -96,6 +138,37 @@ async function createResponseText(params: {
   maxOutputTokens?: number
 }): Promise<ResponseTextResult> {
   const { env, model, instructions, input, maxOutputTokens } = params
+  const provider = getAiProvider(env)
+
+  if (provider === 'gemini') {
+    if (!env.GEMINI_API_KEY) {
+      throw new Error('GEMINI_API_KEY is required when using Gemini API')
+    }
+    const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY, vertexai: false })
+    const config: Record<string, unknown> = {
+      systemInstruction: instructions,
+    }
+    if (typeof maxOutputTokens === 'number' && Number.isFinite(maxOutputTokens)) {
+      config.maxOutputTokens = maxOutputTokens
+    }
+    const response = await ai.models.generateContent({
+      model,
+      contents: input,
+      config,
+    })
+    const text = response.text
+    if (!text) {
+      throw new Error('Gemini generateContent returned empty output')
+    }
+    return {
+      text,
+      usage: (response as { usageMetadata?: unknown }).usageMetadata,
+    }
+  }
+
+  if (!env.OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY is required when using OpenAI API')
+  }
   const url = buildResponsesUrl(env.OPENAI_BASE_URL)
   const body: Record<string, unknown> = {
     model,
@@ -157,7 +230,10 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     const runDate = new Date(`${today}T23:59:59Z`)
     const now = Number.isNaN(runDate.getTime()) ? new Date() : runDate
     const skipTTS = this.env.SKIP_TTS === 'true'
-    const maxTokens = Number.parseInt(this.env.OPENAI_MAX_TOKENS || '4096')
+    const aiProvider = getAiProvider(this.env)
+    const maxTokens = getMaxTokens(this.env, aiProvider)
+    const primaryModel = getPrimaryModel(this.env, aiProvider)
+    const thinkingModel = getThinkingModel(this.env, aiProvider)
     const testStep = (this.env.WORKFLOW_TEST_STEP || '').trim().toLowerCase()
 
     if (testStep) {
@@ -170,7 +246,7 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
         if (testStep === 'openai' || testStep === 'responses') {
           return (await createResponseText({
             env: this.env,
-            model: this.env.OPENAI_MODEL!,
+            model: primaryModel,
             instructions: testInstructions,
             input: testInput,
             maxOutputTokens: maxTokens,
@@ -186,7 +262,7 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
           const storyResponse = await getStoryContent(story, maxTokens, this.env)
           return (await createResponseText({
             env: this.env,
-            model: this.env.OPENAI_MODEL!,
+            model: primaryModel,
             instructions: summarizeStoryPrompt,
             input: storyResponse,
           })).text
@@ -199,7 +275,7 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
           ].join('\n\n---\n\n')
           return (await createResponseText({
             env: this.env,
-            model: this.env.OPENAI_THINKING_MODEL || this.env.OPENAI_MODEL!,
+            model: thinkingModel,
             instructions: summarizePodcastPrompt,
             input: this.env.WORKFLOW_TEST_INPUT || sampleStories,
             maxOutputTokens: maxTokens,
@@ -214,7 +290,7 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
           const sampleInput = `<stories>[]</stories>\n\n---\n\n${sampleStories}`
           return (await createResponseText({
             env: this.env,
-            model: this.env.OPENAI_THINKING_MODEL || this.env.OPENAI_MODEL!,
+            model: thinkingModel,
             instructions: summarizeBlogPrompt,
             input: this.env.WORKFLOW_TEST_INPUT || sampleInput,
             maxOutputTokens: maxTokens,
@@ -225,7 +301,7 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
           const sampleInput = this.env.WORKFLOW_TEST_INPUT || '女：Hello 大家好，欢迎收听测试播客。\n男：大家好，我是老冯。'
           return (await createResponseText({
             env: this.env,
-            model: this.env.OPENAI_MODEL!,
+            model: primaryModel,
             instructions: introPrompt,
             input: sampleInput,
             maxOutputTokens: maxTokens,
@@ -306,7 +382,7 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
       const text = await step.do(`summarize story ${story.id}: ${story.title}`, retryConfig, async () => {
         const { text, usage, finishReason } = await createResponseText({
           env: this.env,
-          model: this.env.OPENAI_MODEL!,
+          model: primaryModel,
           instructions: summarizeStoryPrompt,
           input: storyResponse,
         })
@@ -339,7 +415,7 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     const podcastContent = await step.do('create podcast content', retryConfig, async () => {
       const { text, usage, finishReason } = await createResponseText({
         env: this.env,
-        model: this.env.OPENAI_THINKING_MODEL || this.env.OPENAI_MODEL!,
+        model: thinkingModel,
         instructions: summarizePodcastPrompt,
         input: allStories.join('\n\n---\n\n'),
         maxOutputTokens: maxTokens,
@@ -357,7 +433,7 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     const blogContent = await step.do('create blog content', retryConfig, async () => {
       const { text, usage, finishReason } = await createResponseText({
         env: this.env,
-        model: this.env.OPENAI_THINKING_MODEL || this.env.OPENAI_MODEL!,
+        model: thinkingModel,
         instructions: summarizeBlogPrompt,
         input: `<stories>${JSON.stringify(stories)}</stories>\n\n---\n\n${allStories.join('\n\n---\n\n')}`,
         maxOutputTokens: maxTokens,
@@ -375,7 +451,7 @@ export class HackerNewsWorkflow extends WorkflowEntrypoint<Env, Params> {
     const introContent = await step.do('create intro content', retryConfig, async () => {
       const { text, usage, finishReason } = await createResponseText({
         env: this.env,
-        model: this.env.OPENAI_MODEL!,
+        model: primaryModel,
         instructions: introPrompt,
         input: podcastContent,
       })

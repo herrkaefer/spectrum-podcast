@@ -4,18 +4,24 @@
 
 ### 编辑 `worker/.env.local`
 
-**必需配置：**
+**必需配置（二选一）：**
 
 ```bash
 # 填入你的 OpenAI API Key
 OPENAI_API_KEY=sk-your-actual-api-key-here
+
+# 或者填入你的 Gemini API Key（未配置 OPENAI_API_KEY 时会使用 Gemini）
+GEMINI_API_KEY=your-gemini-api-key
 ```
 
 **可选配置：**
 
 - `OPENAI_MODEL`: 默认使用 gpt-4o，可以改为 gpt-4o-mini 以降低成本
+- `GEMINI_MODEL`: Gemini 模型名称，例如 gemini-2.0-flash
+- `GEMINI_THINKING_MODEL`: Gemini 思考模型（可选，不填则使用 `GEMINI_MODEL`）
 - `JINA_KEY`: 用于网页抓取，如果没有会使用备用方案
 - `OPENAI_MAX_TOKENS`: 默认 4096，可根据需要调整
+- `GEMINI_MAX_TOKENS`: 默认 4096，可根据需要调整
 - `GMAIL_CLIENT_ID`: Gmail OAuth 客户端 ID（使用 Gmail newsletter 来源时需要）
 - `GMAIL_CLIENT_SECRET`: Gmail OAuth 客户端密钥（使用 Gmail newsletter 来源时需要）
 - `GMAIL_REFRESH_TOKEN`: Gmail OAuth refresh token（使用 Gmail newsletter 来源时需要）
@@ -112,7 +118,7 @@ pnpm dev
 2. 触发 workflow：`curl -X POST http://localhost:8787`
 3. 观察控制台输出，确认：
    - ✓ 能够获取 Hacker News 数据
-   - ✓ 能够调用 OpenAI API 生成摘要
+   - ✓ 能够调用 OpenAI 或 Gemini API 生成摘要
    - ⚠️ TTS 部分可能卡住（这是正常的，可以注释掉）
 
 ### 完整测试
@@ -128,7 +134,7 @@ pnpm dev
 
 检查：
 
-- `OPENAI_API_KEY` 是否正确填写
+- `OPENAI_API_KEY` / `GEMINI_API_KEY` 是否正确填写
 - 端口 8787 是否被占用
 
 ### API 调用失败
