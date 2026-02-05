@@ -148,6 +148,14 @@ const defaultExcludePathKeywords = [
   '/contact',
 ]
 
+const CHICAGO_TIMEZONE = 'America/Chicago'
+const ONE_DAY_MS = 24 * 60 * 60 * 1000
+
+const archiveLinkKeywords = [
+  'view this email in your browser',
+  'view it in your browser',
+]
+
 function unwrapTrackingUrl(href: string) {
   let url: URL
   try {
@@ -178,6 +186,99 @@ function unwrapTrackingUrl(href: string) {
   }
 
   return { href, unwrapped: false }
+}
+
+function getDateKeyInTimeZone(date: Date, timeZone: string) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date)
+
+  const year = parts.find(part => part.type === 'year')?.value || '0000'
+  const month = parts.find(part => part.type === 'month')?.value || '01'
+  const day = parts.find(part => part.type === 'day')?.value || '01'
+
+  return `${year}-${month}-${day}`
+}
+
+function getTimeZoneOffsetMs(date: Date, timeZone: string) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(date)
+
+  const get = (type: string) => parts.find(part => part.type === type)?.value || '00'
+  const utcTime = Date.UTC(
+    Number(get('year')),
+    Number(get('month')) - 1,
+    Number(get('day')),
+    Number(get('hour')),
+    Number(get('minute')),
+    Number(get('second')),
+  )
+
+  return utcTime - date.getTime()
+}
+
+function zonedTimeToUtc(
+  dateKey: string,
+  timeZone: string,
+  hour = 0,
+  minute = 0,
+  second = 0,
+) {
+  const [year, month, day] = dateKey.split('-').map(Number)
+  const utcGuess = Date.UTC(year, month - 1, day, hour, minute, second)
+  const offset = getTimeZoneOffsetMs(new Date(utcGuess), timeZone)
+  return new Date(utcGuess - offset)
+}
+
+function getYesterdayRangeInChicago(now: Date) {
+  const yesterday = new Date(now.getTime() - ONE_DAY_MS)
+  const dateKey = getDateKeyInTimeZone(yesterday, CHICAGO_TIMEZONE)
+  const startUtc = zonedTimeToUtc(dateKey, CHICAGO_TIMEZONE, 0, 0, 0)
+  const endUtc = zonedTimeToUtc(dateKey, CHICAGO_TIMEZONE, 23, 59, 59)
+  return { dateKey, startUtc, endUtc }
+}
+
+function findArchiveLink(html: string) {
+  const $ = cheerio.load(html)
+  const anchors = $('a[href]').map((_, el) => {
+    const rawHref = $(el).attr('href')?.trim() || ''
+    const text = normalizeText($(el).text()).toLowerCase()
+    return { rawHref, text }
+  }).get()
+
+  const match = anchors.find(anchor =>
+    anchor.text && archiveLinkKeywords.some(keyword => anchor.text.includes(keyword)),
+  )
+
+  if (!match?.rawHref) {
+    return ''
+  }
+
+  const { href } = unwrapTrackingUrl(match.rawHref)
+  return href
+}
+
+async function fetchHtml(url: string) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 15000)
+  try {
+    const response = await fetch(url, { signal: controller.signal })
+    return await response.text()
+  }
+  finally {
+    clearTimeout(timeout)
+  }
 }
 
 async function resolveTrackingRedirect(href: string, cache: Map<string, string>) {
@@ -471,8 +572,10 @@ export async function fetchGmailItems(
 
   const userId = env.GMAIL_USER_EMAIL || 'me'
   const token = await fetchAccessToken(env)
-  const windowStart = new Date(now.getTime() - lookbackDays * 24 * 60 * 60 * 1000)
-  const query = buildGmailQuery(source.label, windowStart, now)
+  const { dateKey: targetDateKey, startUtc, endUtc } = getYesterdayRangeInChicago(now)
+  const windowStart = startUtc || new Date(now.getTime() - Math.max(lookbackDays, 2) * ONE_DAY_MS)
+  const windowEnd = endUtc || now
+  const query = buildGmailQuery(source.label, windowStart, windowEnd)
   let maxMessages = source.maxMessages || 50
   if (env.NODE_ENV && env.NODE_ENV !== 'production') {
     maxMessages = Math.min(maxMessages, 2)
@@ -495,29 +598,46 @@ export async function fetchGmailItems(
 
     const subject = getHeader(message.payload?.headers, 'Subject')
     const receivedAt = message.internalDate ? new Date(Number(message.internalDate)) : now
-    if (receivedAt < windowStart || receivedAt > now) {
+    if (receivedAt < windowStart || receivedAt > windowEnd) {
       continue
     }
 
-    const links = await extractLinks(html, source.linkRules, { subject, messageId: message.id })
-    if (links.length === 0) {
-      console.warn('gmail message has no matching links', { id: message.id, subject })
+    const receivedDateKey = getDateKeyInTimeZone(receivedAt, CHICAGO_TIMEZONE)
+    if (receivedDateKey !== targetDateKey) {
       continue
     }
 
-    links.forEach((link, index) => {
-      items.push({
-        id: `${message.id}:${index}`,
-        title: link.text || subject,
-        url: link.href,
-        hackerNewsUrl: link.href,
-        sourceName: source.name,
-        sourceUrl: source.url,
-        publishedAt: receivedAt.toISOString(),
-        sourceItemId: message.id,
-        sourceItemTitle: subject,
-      })
-    })
+    const archiveLink = findArchiveLink(html)
+    if (archiveLink) {
+      try {
+        const archiveHtml = await fetchHtml(archiveLink)
+        const archiveRules = { ...source.linkRules, resolveTrackingLinks: false }
+        const links = await extractLinks(archiveHtml, archiveRules, { subject, messageId: message.id })
+        if (links.length === 0) {
+          console.warn('newsletter archive has no matching links', { id: message.id, subject })
+          continue
+        }
+        links.forEach((link, index) => {
+          items.push({
+            id: `${message.id}:${index}`,
+            title: link.text || subject,
+            url: link.href,
+            hackerNewsUrl: link.href,
+            sourceName: source.name,
+            sourceUrl: source.url,
+            publishedAt: receivedAt.toISOString(),
+            sourceItemId: message.id,
+            sourceItemTitle: subject,
+          })
+        })
+        continue
+      }
+      catch (error) {
+        console.warn('failed to fetch archive html, skip newsletter', { error, id: message.id })
+        continue
+      }
+    }
+    console.warn('newsletter missing archive link, skip message', { id: message.id, subject })
   }
 
   return items

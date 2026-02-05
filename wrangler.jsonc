@@ -4,7 +4,7 @@
  */
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "podcast",
+  "name": "spectrum-podcast",
   "main": ".open-next/worker.js",
   "minify": true,
   "upload_source_maps": true,
@@ -28,26 +28,24 @@
     "mode": "smart"
   },
   "keep_vars": true,
-  "kv_namespaces": [
-    {
-      "binding": "PODCAST_KV",
-      "id": "bfc65509c1634589a29b90f956ab0d1a"
-    }
-  ],
+  "kv_namespaces": [{
+    "binding": "PODCAST_KV",
+    "id": "39eea2627b91464fa9346344c8426066"
+  }],
   "r2_buckets": [
     {
       "binding": "PODCAST_R2",
-      "bucket_name": "podcast"
+      "bucket_name": "spectrum-podcast"
     },
     {
       "binding": "NEXT_INC_CACHE_R2_BUCKET",
-      "bucket_name": "podcast"
+      "bucket_name": "spectrum-podcast"
     }
   ],
   "services": [
     {
       "binding": "WORKER_SELF_REFERENCE",
-      "service": "podcast"
+      "service": "spectrum-podcast"
     }
   ],
   "durable_objects": {

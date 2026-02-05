@@ -4,7 +4,7 @@
  */
 {
   "$schema": "../node_modules/wrangler/config-schema.json",
-  "name": "podcast-worker",
+  "name": "spectrum-podcast-worker",
   "main": "./index.ts",
   "minify": true,
   "upload_source_maps": true,
@@ -13,6 +13,7 @@
     "nodejs_compat"
   ],
   "assets": {
+    "binding": "ASSETS",
     "directory": "./static"
   },
   "observability": {
@@ -25,7 +26,9 @@
   },
   "triggers": {
     "crons": [
-      "30 23 * * *"
+      // Chicago 23:30 local time (UTC 04:30 or 05:30 depending on DST)
+      "30 4 * * *",
+      "30 5 * * *"
     ]
   },
   "keep_vars": true,
@@ -39,16 +42,14 @@
       "class_name": "HackerNewsWorkflow"
     }
   ],
-  "kv_namespaces": [
-    {
-      "binding": "PODCAST_KV",
-      "id": "bfc65509c1634589a29b90f956ab0d1a"
-    }
-  ],
+  "kv_namespaces": [{
+    "binding": "PODCAST_KV",
+    "id": "39eea2627b91464fa9346344c8426066"
+  }],
   "r2_buckets": [
     {
       "binding": "PODCAST_R2",
-      "bucket_name": "podcast"
+      "bucket_name": "spectrum-podcast"
     }
   ]
 }

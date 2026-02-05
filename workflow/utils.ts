@@ -2,6 +2,43 @@ import puppeteer from '@cloudflare/puppeteer'
 import * as cheerio from 'cheerio'
 import { $fetch } from 'ofetch'
 
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function getErrorStatus(error: unknown) {
+  const err = error as { response?: { status?: number }, status?: number }
+  return err?.response?.status ?? err?.status
+}
+
+async function getContentFromJinaWithRetry(
+  url: string,
+  format: 'html' | 'markdown',
+  selector?: { include?: string, exclude?: string },
+  JINA_KEY?: string,
+  options?: { retryLimit?: number, retryDelayMs?: number },
+) {
+  const retryLimit = options?.retryLimit ?? 2
+  let retryDelayMs = options?.retryDelayMs ?? 2000
+
+  for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
+    try {
+      return await getContentFromJina(url, format, selector, JINA_KEY)
+    }
+    catch (error) {
+      const status = getErrorStatus(error)
+      if (status !== 429 || attempt >= retryLimit) {
+        throw error
+      }
+      console.warn(`Jina rate limited (429), retrying in ${retryDelayMs}ms`, { url, attempt: attempt + 1 })
+      await sleep(retryDelayMs)
+      retryDelayMs *= 2
+    }
+  }
+
+  return ''
+}
+
 export async function getContentFromJina(url: string, format: 'html' | 'markdown', selector?: { include?: string, exclude?: string }, JINA_KEY?: string) {
   const jinaHeaders: HeadersInit = {
     'X-Retain-Images': 'none',
@@ -30,6 +67,11 @@ export async function getContentFromJina(url: string, format: 'html' | 'markdown
 }
 
 export async function getContentFromFirecrawl(url: string, format: 'html' | 'markdown', selector?: { include?: string, exclude?: string }, FIRECRAWL_KEY?: string) {
+  if (!FIRECRAWL_KEY) {
+    console.warn('FIRECRAWL_KEY is not configured, skip firecrawl', { url })
+    return ''
+  }
+
   const firecrawlHeaders: HeadersInit = {
     Authorization: `Bearer ${FIRECRAWL_KEY}`,
   }
@@ -65,9 +107,12 @@ export async function getContentFromFirecrawl(url: string, format: 'html' | 'mar
 export async function getHackerNewsTopStories(today: string, { JINA_KEY, FIRECRAWL_KEY }: { JINA_KEY?: string, FIRECRAWL_KEY?: string }) {
   const url = `https://news.ycombinator.com/front?day=${today}`
 
-  const html = await getContentFromJina(url, 'html', {}, JINA_KEY)
+  const html = await getContentFromJinaWithRetry(url, 'html', {}, JINA_KEY)
     .catch((error) => {
       console.error('getHackerNewsTopStories from Jina failed', error)
+      if (!FIRECRAWL_KEY) {
+        return ''
+      }
       return getContentFromFirecrawl(url, 'html', {}, FIRECRAWL_KEY)
     })
 
@@ -94,14 +139,20 @@ export async function getHackerNewsStory(story: Story, maxTokens: number, { JINA
   }
 
   const [article, comments] = await Promise.all([
-    getContentFromJina(story.url!, 'markdown', {}, JINA_KEY)
+    getContentFromJinaWithRetry(story.url!, 'markdown', {}, JINA_KEY)
       .catch((error) => {
         console.error('getHackerNewsStory from Jina failed', error)
+        if (!FIRECRAWL_KEY) {
+          return ''
+        }
         return getContentFromFirecrawl(story.url!, 'markdown', {}, FIRECRAWL_KEY)
       }),
-    getContentFromJina(`https://news.ycombinator.com/item?id=${story.id}`, 'markdown', { include: '.comment-tree', exclude: '.navs' }, JINA_KEY)
+    getContentFromJinaWithRetry(`https://news.ycombinator.com/item?id=${story.id}`, 'markdown', { include: '.comment-tree', exclude: '.navs' }, JINA_KEY)
       .catch((error) => {
         console.error('getHackerNewsStory from Jina failed', error)
+        if (!FIRECRAWL_KEY) {
+          return ''
+        }
         return getContentFromFirecrawl(`https://news.ycombinator.com/item?id=${story.id}`, 'markdown', { include: '.comment-tree', exclude: '.navs' }, FIRECRAWL_KEY)
       }),
   ])
@@ -136,9 +187,12 @@ export async function getStoryContent(story: Story, maxTokens: number, { JINA_KE
   }
 
   const storyUrl = story.url
-  const article = await getContentFromJina(storyUrl, 'markdown', {}, JINA_KEY)
+  const article = await getContentFromJinaWithRetry(storyUrl, 'markdown', {}, JINA_KEY)
     .catch((error) => {
       console.error('getStoryContent from Jina failed', error)
+      if (!FIRECRAWL_KEY) {
+        return ''
+      }
       return getContentFromFirecrawl(storyUrl, 'markdown', {}, FIRECRAWL_KEY)
     })
 

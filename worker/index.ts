@@ -3,6 +3,8 @@ export * from '../workflow'
 interface Env extends CloudflareEnv {
   PODCAST_WORKFLOW: Workflow
   BROWSER: Fetcher
+  PODCAST_SITE_URL?: string
+  TRIGGER_TOKEN?: string
 }
 
 export default {
@@ -26,10 +28,20 @@ export default {
     return new Response('create workflow success')
   },
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
-    const { pathname, hostname } = new URL(request.url)
+    const { pathname, hostname, searchParams } = new URL(request.url)
     if (request.method === 'POST' && hostname === 'localhost') {
       // curl -X POST http://localhost:8787
       return this.runWorkflow(request, env, ctx)
+    }
+    if (pathname === '/trigger' && request.method === 'POST') {
+      const token = searchParams.get('token')
+      if (!env.TRIGGER_TOKEN || token !== env.TRIGGER_TOKEN) {
+        return new Response('Unauthorized', { status: 401 })
+      }
+      return this.runWorkflow(request, env, ctx)
+    }
+    if (pathname === '/audio' || pathname === '/audio.html') {
+      return env.ASSETS.fetch(request)
     }
     if (pathname.includes('/static')) {
       const filename = pathname.replace('/static/', '')
@@ -40,9 +52,26 @@ export default {
       })
       return new Response(file?.body)
     }
-    return Response.redirect(`https://hacker-podcast.agi.li/${pathname}`, 302)
+    const siteUrl = env.PODCAST_SITE_URL ?? 'https://hacker-podcast.agi.li'
+    return Response.redirect(new URL(pathname, siteUrl).toString(), 302)
   },
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    const scheduledAt = new Date(event.scheduledTime)
+    const timeParts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Chicago',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(scheduledAt)
+
+    const hour = Number(timeParts.find(part => part.type === 'hour')?.value || '0')
+    const minute = Number(timeParts.find(part => part.type === 'minute')?.value || '0')
+
+    if (hour !== 23 || minute !== 30) {
+      console.info('skip schedule outside Chicago 23:30', { hour, minute })
+      return
+    }
+
     return this.runWorkflow(event, env, ctx)
   },
 }

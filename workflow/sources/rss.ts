@@ -18,9 +18,28 @@ function parseDate(dateText: string | undefined) {
   return Number.isNaN(parsed.getTime()) ? null : parsed
 }
 
+function getDateKeyInTimeZone(date: Date, timeZone: string) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date)
+
+  const year = parts.find(part => part.type === 'year')?.value || '0000'
+  const month = parts.find(part => part.type === 'month')?.value || '01'
+  const day = parts.find(part => part.type === 'day')?.value || '01'
+
+  return `${year}-${month}-${day}`
+}
+
 function isWithinLookback(publishedAt: Date, now: Date, lookbackDays: number) {
   const windowStart = new Date(now.getTime() - lookbackDays * 24 * 60 * 60 * 1000)
   return publishedAt >= windowStart && publishedAt <= now
+}
+
+function isSameDayInTimeZone(publishedAt: Date, now: Date, timeZone: string) {
+  return getDateKeyInTimeZone(publishedAt, timeZone) === getDateKeyInTimeZone(now, timeZone)
 }
 
 function extractRssItems(xml: string) {
@@ -60,6 +79,8 @@ function normalizeItem(item: RssItem) {
 }
 
 export async function fetchRssItems(source: SourceConfig, now: Date, lookbackDays: number) {
+  const timeZone = 'America/Chicago'
+
   try {
     const xml = await $fetch<string>(source.url, {
       timeout: 30000,
@@ -76,9 +97,10 @@ export async function fetchRssItems(source: SourceConfig, now: Date, lookbackDay
         const publishedAt = parseDate(item.pubDate)
         if (!publishedAt) {
           console.warn('rss item missing pubDate', { source: source.name, title: item.title })
-          return true
+          return false
         }
-        return isWithinLookback(publishedAt, now, lookbackDays)
+        return isSameDayInTimeZone(publishedAt, now, timeZone)
+          && isWithinLookback(publishedAt, now, lookbackDays)
       })
       .map(item => ({
         id: item.guid || item.link,
