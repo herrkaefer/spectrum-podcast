@@ -152,8 +152,7 @@ const CHICAGO_TIMEZONE = 'America/Chicago'
 const ONE_DAY_MS = 24 * 60 * 60 * 1000
 
 const archiveLinkKeywords = [
-  'view this email in your browser',
-  'view it in your browser',
+  'in your browser',
 ]
 
 function unwrapTrackingUrl(href: string) {
